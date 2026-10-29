@@ -39,18 +39,28 @@ If you downloaded an old `CodexBar.exe`, delete it. There is nothing else to cle
 ```bash
 git clone https://github.com/babakarto/CodexBar-Win.git
 cd CodexBar-Win
-pip install -r requirements.txt
-python codexbar.py            # Claude tab first
-python codexbar.py --codex    # Codex tab first (falls back to Claude if Codex isn't set up)
+uv sync                       # creates .venv and installs the locked deps
+uv run codexbar.py            # Claude tab first
+uv run codexbar.py --codex    # Codex tab first (falls back to Claude if Codex isn't set up)
 ```
 
-Or double-click `CodexBar.bat` — it installs dependencies and launches.
+Or double-click `CodexBar.bat` — it syncs the environment and launches.
+
+## Build the .exe
+
+```powershell
+.\build.ps1
+```
+
+Uses `uv` for the environment and PyInstaller (dev dependency) for the bundle, and
+leaves a single `dist\CodexBar.exe` with no console window. `build\`, `dist\` and the
+generated `CodexBar.spec` are ignored by git.
 
 ## Requirements
 
 - **Windows 10 or 11**
 - **Claude Code CLI** installed and logged in (`claude` in PATH)
-- Python 3.10+
+- **uv** ([install](https://docs.astral.sh/uv/)) — it provides Python 3.10+ for the venv
 
 ## Features
 

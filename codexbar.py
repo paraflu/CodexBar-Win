@@ -5,8 +5,8 @@ System tray app that shows your REAL Claude usage.
 Native customtkinter popup. Uses only the local Claude Code CLI and its
 credentials file — it never touches your browser.
 
-Requirements: pip install pystray Pillow customtkinter
-Usage: python codexbar.py
+Requirements: uv sync
+Usage: uv run codexbar.py [--codex]     (build.ps1 produces dist/CodexBar.exe)
 """
 
 import os
@@ -23,6 +23,18 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+
+if getattr(sys, 'frozen', False):
+    # The PyInstaller windowed exe has no console: keep the diagnostics on disk.
+    # shortcut: append-only, never rotated; upgrade if the file ever matters
+    try:
+        _log_dir = Path.home() / '.codexbar'
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        sys.stdout = sys.stderr = open(_log_dir / 'codexbar.log', 'a',
+                                       buffering=1, encoding='utf-8', errors='replace')
+        print(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} ===")
+    except Exception:
+        pass
 
 try:
     from PIL import Image, ImageDraw

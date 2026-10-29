@@ -1,0 +1,20 @@
+[project]
+name = "codexbar-win"
+version = "1.0.0"
+description = "Windows system tray app showing real Claude Code and OpenAI Codex usage"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "customtkinter>=5.2",
+    "pillow>=10.0",
+    "pystray>=0.19.5",
+    "pywinpty>=2.0",
+]
+
+[dependency-groups]
+dev = ["pyinstaller>=6.11"]
+
+# Tray app: the source is run directly and shipped as a PyInstaller exe,
+# so there is nothing to build or install from this project.
+[tool.uv]
+package = false

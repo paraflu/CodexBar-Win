@@ -10,21 +10,18 @@ Write-Host ""
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
-# Check Python
-$python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $python) {
-    Write-Host "[!] Python not found. Install Python 3.10+ from python.org" -ForegroundColor Red
+# uv owns the environment: it also fetches Python if the machine has none
+$uv = Get-Command uv -ErrorAction SilentlyContinue
+if (-not $uv) {
+    Write-Host "[!] uv not found. Install it: https://docs.astral.sh/uv/" -ForegroundColor Red
     exit 1
 }
 
-Write-Host "[*] Python found: $($python.Source)" -ForegroundColor Green
+Write-Host "[*] uv found: $($uv.Source)" -ForegroundColor Green
 
-# Install dependencies
-Write-Host "[*] Installing dependencies..." -ForegroundColor Cyan
-pip install -r requirements.txt --quiet --break-system-packages 2>$null
-if (-not $?) {
-    pip install -r requirements.txt --quiet
-}
+Write-Host "[*] Syncing dependencies..." -ForegroundColor Cyan
+uv sync
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "[*] Dependencies installed." -ForegroundColor Green
 
@@ -42,4 +39,4 @@ Write-Host "    Right-click the tray icon to open menu" -ForegroundColor DarkGra
 Write-Host "    Double-click to open the usage panel" -ForegroundColor DarkGray
 Write-Host ""
 
-python codexbar.py
+uv run codexbar.py
