@@ -2,7 +2,7 @@
 
 Write-Host ""
 Write-Host "  ╔═══════════════════════════════════════╗" -ForegroundColor Magenta
-Write-Host "  ║      CodexBar for Windows v1.0.0      ║" -ForegroundColor Magenta
+Write-Host "  ║      CodexBar for Windows v1.2.0      ║" -ForegroundColor Magenta
 Write-Host "  ║   Claude Code & Codex Monitor           ║" -ForegroundColor Magenta
 Write-Host "  ╚═══════════════════════════════════════╝" -ForegroundColor Magenta
 Write-Host ""

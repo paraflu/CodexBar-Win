@@ -1,5 +1,5 @@
 """
-CodexBar for Windows v1.0.0
+CodexBar for Windows v1.2.0
 ============================
 System tray app that shows your REAL Claude usage.
 Native customtkinter popup. Uses only the local Claude Code CLI and its
@@ -1870,7 +1870,7 @@ class CodexBarApp:
 if __name__ == '__main__':
     print(r"""
    ========================================
-    CodexBar for Windows v1.0.0
+    CodexBar for Windows v1.2.0
     Native popup — no browser needed
    ========================================
     """)

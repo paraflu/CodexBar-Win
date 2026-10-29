@@ -1,6 +1,6 @@
 [project]
 name = "codexbar-win"
-version = "1.0.0"
+version = "1.2.0"
 description = "Windows system tray app showing real Claude Code and OpenAI Codex usage"
 readme = "README.md"
 requires-python = ">=3.10"
