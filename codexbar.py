@@ -1537,7 +1537,8 @@ class CodexBarPopup(ctk.CTkToplevel):
 # ─────────────────────────────────────────────
 
 class CodexBarApp:
-    def __init__(self):
+    def __init__(self, prefer_codex=False):
+        self.prefer_codex = prefer_codex
         self.fetcher = ClaudeDataFetcher()
         self.codex_fetcher = CodexDataFetcher()
         self.root = None
@@ -1549,16 +1550,17 @@ class CodexBarApp:
         self.active_provider = "claude"
 
     @staticmethod
-    def default_provider(claude_data, codex_data):
+    def default_provider(claude_data, codex_data, prefer_codex=False):
         """Pick the provider to show at startup.
 
-        Claude stays the default, except when Claude Code is not installed
-        while Codex is: a Codex-only user should not be greeted by the
-        Claude icon and an "Install Claude Code" prompt (issue #10).
+        Claude stays the default, except when the user asked for Codex
+        (--codex) or Claude Code is not installed while Codex is: a
+        Codex-only user should not be greeted by the Claude icon and an
+        "Install Claude Code" prompt (issue #10).
         """
         claude_installed = bool((claude_data or {}).get("installed", False))
         codex_available = bool((codex_data or {}).get("available", False))
-        if not claude_installed and codex_available:
+        if codex_available and (prefer_codex or not claude_installed):
             return "openai"
         return "claude"
 
@@ -1573,7 +1575,8 @@ class CodexBarApp:
             print(f"[CodexBar] Codex fetch err: {e}")
             self.codex_data = CodexDataFetcher._empty()
 
-        self.active_provider = self.default_provider(self.fetcher.data, self.codex_data)
+        self.active_provider = self.default_provider(
+            self.fetcher.data, self.codex_data, self.prefer_codex)
         print(f"[CodexBar] Default tab: {'Codex' if self.active_provider == 'openai' else 'Claude'}")
 
         # ── hidden tkinter root ──
@@ -1706,4 +1709,4 @@ if __name__ == '__main__':
     Native popup — no browser needed
    ========================================
     """)
-    CodexBarApp().start()
+    CodexBarApp(prefer_codex='--codex' in sys.argv).start()

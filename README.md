@@ -40,7 +40,8 @@ If you downloaded an old `CodexBar.exe`, delete it. There is nothing else to cle
 git clone https://github.com/babakarto/CodexBar-Win.git
 cd CodexBar-Win
 pip install -r requirements.txt
-python codexbar.py
+python codexbar.py            # Claude tab first
+python codexbar.py --codex    # Codex tab first (falls back to Claude if Codex isn't set up)
 ```
 
 Or double-click `CodexBar.bat` — it installs dependencies and launches.
