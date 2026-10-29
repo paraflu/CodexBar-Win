@@ -652,9 +652,12 @@ def make_icon(sp=1.0, wp=1.0, sz=64, provider="claude"):
 # ─────────────────────────────────────────────
 
 class CodexDataFetcher:
-    """Fetch usage data from OpenAI Codex local session files (~/.codex/)."""
+    """Fetch usage data from the OpenAI Codex account (~/.codex/)."""
 
     CODEX_DIR = Path.home() / ".codex"
+    # Same endpoint the ChatGPT web dashboard uses: the quota is per account and
+    # local rollouts go stale (newer builds write .jsonl.zst, pi writes none).
+    USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
     @staticmethod
     def _empty():
@@ -690,31 +693,72 @@ class CodexDataFetcher:
             pass
 
         # read auth for plan type
+        # read auth for plan type
         try:
-            auth = self.CODEX_DIR / "auth.json"
-            if auth.exists():
-                aj = json.loads(auth.read_text(encoding="utf-8"))
-                # plan is embedded in the JWT claims
-                tokens = aj.get("tokens", {})
-                at = tokens.get("access_token", "")
-                if at:
-                    # decode JWT payload (base64 middle segment)
-                    parts = at.split(".")
-                    if len(parts) >= 2:
-                        payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
-                        claims = json.loads(base64.b64decode(payload))
-                        plan = claims.get("https://api.openai.com/auth", {}).get(
-                            "chatgpt_plan_type", "")
-                        if plan:
-                            d["plan"] = plan.capitalize()
+            tokens = json.loads((self.CODEX_DIR / "auth.json").read_text(encoding="utf-8")).get("tokens", {})
+            plan = self._openai_claims(tokens.get("access_token", "")).get("chatgpt_plan_type", "")
+            if plan:
+                d["plan"] = plan.capitalize()
         except Exception:
             pass
 
         # scan session JSONL files for rate_limits + token usage
         self._scan_sessions(d)
 
+        # live quota wins: the local snapshot above is only a fallback
+        if self._fetch_live_usage(d):
+            d["source"] = "api"
+
         d["updated"] = datetime.now().strftime("Updated %H:%M")
         return d
+    def _fetch_live_usage(self, d):
+        """Overwrite the 5h/weekly quota with the live account answer."""
+        try:
+            tokens = json.loads((self.CODEX_DIR / "auth.json").read_text(encoding="utf-8"))["tokens"]
+            usage = self._usage_request(tokens)
+        except Exception:
+            return False  # offline or token unusable: keep the local snapshot
+
+        rl = usage.get("rate_limit") or {}
+        for key, pct, reset in (("primary_window", "session_used_pct", "session_reset"),
+                                ("secondary_window", "weekly_used_pct", "weekly_reset")):
+            window = rl.get(key) or {}
+            if window:
+                d[pct] = int(window.get("used_percent", 0))
+                if window.get("reset_at"):
+                    d[reset] = self._format_reset(window["reset_at"])
+        if usage.get("plan_type"):
+            d["plan"] = usage["plan_type"].capitalize()
+        return True
+
+    def _usage_request(self, tokens):
+        """GET the live quota; any failure means falling back to local data.
+
+        No token refresh here on purpose: the stored refresh_token rotates, so
+        minting one without persisting it would break the next codex run.
+        """
+        access = tokens.get("access_token", "")
+        req = Request(self.USAGE_URL, headers={
+            "Authorization": f"Bearer {access}",
+            "chatgpt-account-id": tokens.get("account_id")
+            or self._openai_claims(access).get("chatgpt_account_id", ""),
+            "User-Agent": "codex-cli",
+            "Accept": "application/json",
+        })
+        with urlopen(req, timeout=8) as r:
+            return json.loads(r.read().decode())
+
+    @staticmethod
+    def _openai_claims(access_token):
+        """The https://api.openai.com/auth claims of an OAuth access token."""
+        try:
+            parts = access_token.split(".")
+            if len(parts) < 2:
+                return {}
+            payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            return json.loads(base64.b64decode(payload)).get("https://api.openai.com/auth", {})
+        except Exception:
+            return {}
 
     def _scan_sessions(self, d):
         """Scan ~/.codex/sessions/ JSONL files for rate limits and tokens."""
@@ -730,7 +774,11 @@ class CodexDataFetcher:
             d["source"] = "config"
             return
 
-        print(f"    Codex: scanning {len(jsonl_files)} session files")
+        # shortcut: .jsonl.zst rollouts are not read (no zstd in stdlib), so the
+        # cost below is a lower bound; upgrade if codex stops writing plain jsonl
+        skipped = len(list(sessions_dir.rglob("*.jsonl.zst")))
+        print(f"    Codex: scanning {len(jsonl_files)} session files"
+              + (f" ({skipped} compressed rollouts skipped)" if skipped else ""))
 
         # get rate limits from most recent file (last token_count entry)
         latest_limits = None
@@ -766,7 +814,8 @@ class CodexDataFetcher:
             d["source"] = "config"
 
         # sum token usage across all sessions for cost estimate
-        total_in = total_out = today_in = today_out = 0
+        total_in = total_out = total_cached = 0
+        today_in = today_out = today_cached = 0
         today = datetime.now().date()
 
         for jf in jsonl_files:
@@ -776,8 +825,10 @@ class CodexDataFetcher:
                     continue
                 inp = tokens.get("input_tokens", 0)
                 out = tokens.get("output_tokens", 0)
+                cached = tokens.get("cached_input_tokens", 0)  # already counted inside input_tokens
                 total_in += inp
                 total_out += out
+                total_cached += cached
 
                 # check if file is from today
                 try:
@@ -785,14 +836,18 @@ class CodexDataFetcher:
                     if datetime.strptime(ts_str, "%Y-%m-%d").date() == today:
                         today_in += inp
                         today_out += out
+                        today_cached += cached
                 except Exception:
                     pass
             except Exception:
                 continue
 
-        # OpenAI pricing estimate (gpt-4o class: ~$2.50/M input, ~$10/M output)
-        c30 = (total_in * 2.5 + total_out * 10) / 1e6
-        ct = (today_in * 2.5 + today_out * 10) / 1e6
+        # gpt-4o class: $2.50/M input, $1.25/M cached input, $10/M output
+        def cost(inp, cached, out):
+            return ((inp - cached) * 2.5 + cached * 1.25 + out * 10) / 1e6
+
+        c30 = cost(total_in, total_cached, total_out)
+        ct = cost(today_in, today_cached, today_out)
 
         def fmt(n):
             if n >= 1e6: return f"{n / 1e6:.1f}M"

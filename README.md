@@ -74,6 +74,13 @@ CodexBar tries multiple methods in order, using the first that succeeds:
 | 2 | **OAuth token** | Reads `~/.claude/.credentials.json`, calls Claude.ai API |
 | 3 | **JSONL logs** | Scans `~/.claude/projects/` for conversation logs (always runs for cost data) |
 
+For **Codex** the quota comes from the same endpoint the ChatGPT dashboard uses
+(`chatgpt.com/backend-api/wham/usage`, token from `~/.codex/auth.json`), because the
+quota is per account and local rollouts go stale: newer Codex builds write
+`.jsonl.zst` and pi sessions write no rollouts at all. Local rollouts remain the
+fallback and the only source of the cost estimate — which is a lower bound, since
+compressed rollouts are skipped and cached input is billed at the cheaper rate.
+
 ## macOS vs Windows
 
 | | [CodexBar](https://github.com/steipete/CodexBar) (macOS) | CodexBar-Win (Windows) |

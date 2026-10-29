@@ -10,3 +10,5 @@ venv/
 .venv/
 _pty_*.txt
 pty_debug.txt
+codexbar-run.log
+codexbar-run.err
