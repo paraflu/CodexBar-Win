@@ -65,9 +65,11 @@ generated `CodexBar.spec` are ignored by git.
 ## Features
 
 - **Dual provider** — Claude Code + OpenAI Codex tabs with smooth animated transitions
-- **Live usage bars** — session and weekly limits with color-coded percentages
+- **Live usage bars** — how much of the session/weekly limit is still left, color-coded, or `—` when the quota isn't readable
+- **Tray tooltip** — hovering the tray icon shows what is left on the 5h and weekly window
 - **Reset countdowns** — know exactly when your limits refresh
-- **Cost tracking** — today's spend and 30-day totals from local logs
+- **Threshold alerts** — tray notification when a 5h or weekly window crosses 80% or 95% used (once per crossing; a reset re-arms it)
+- **Cost tracking** — Claude from `~/.claude` logs, Codex tab from pi agent's own priced logs (`~/.pi/agent/sessions`): real tokens, not an estimate
 - **Native popup** — customtkinter window with rounded corners, slide-up animation
 - **Provider branding** — Claude orange palette + OpenAI dark/green theme, tray icon switches per tab
 - **Smart default tab** — opens on Codex (with the OpenAI tray icon) when Claude Code is not installed
@@ -88,8 +90,13 @@ For **Codex** the quota comes from the same endpoint the ChatGPT dashboard uses
 (`chatgpt.com/backend-api/wham/usage`, token from `~/.codex/auth.json`), because the
 quota is per account and local rollouts go stale: newer Codex builds write
 `.jsonl.zst` and pi sessions write no rollouts at all. Local rollouts remain the
-fallback and the only source of the cost estimate — which is a lower bound, since
-compressed rollouts are skipped and cached input is billed at the cheaper rate.
+fallback for the quota only.
+
+The cost in the Codex tab comes from **pi agent's session logs** in
+`~/.pi/agent/sessions`: pi stores the priced usage of every assistant message
+(`message.usage.cost.total`), so today's and the last-30-days figures are measured
+token spend, not an estimate. Runs of pi inside WSL are not read — only the Windows
+logs.
 
 ## macOS vs Windows
 

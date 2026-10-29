@@ -71,6 +71,64 @@ def _resource_path(relative_path):
     return base / relative_path
 
 
+def _cost_today_text(d):
+    """'—' when no log covers today: $0.00 would claim a number nobody measured."""
+    if not d.get("cost_today_known", False):
+        return "—"
+    return f"${d['cost_today']:.2f}"
+
+
+# ─────────────────────────────────────────────
+# Run at Windows startup  (HKCU\...\Run, no admin needed)
+# ─────────────────────────────────────────────
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_NAME = "CodexBar"
+
+
+def _startup_command():
+    """The command line Windows should run at login."""
+    if getattr(sys, 'frozen', False):
+        exe = Path(sys.executable)
+    else:
+        # dev checkout: pythonw so no console window flashes at login
+        exe = Path(sys.executable).with_name('pythonw.exe')
+        if not exe.exists():
+            exe = Path(sys.executable)
+    script = "" if getattr(sys, 'frozen', False) else f' "{Path(__file__).resolve()}"'
+    flag = " --codex" if '--codex' in sys.argv else ""
+    return f'"{exe}"{script}{flag}'
+
+
+def startup_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            winreg.QueryValueEx(key, _RUN_NAME)
+            return True
+    except (ImportError, OSError):
+        return False
+
+
+def set_startup(enabled):
+    """Add or remove the login entry; returns True when the registry agreed."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, _RUN_NAME, 0, winreg.REG_SZ, _startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, _RUN_NAME)
+                except FileNotFoundError:
+                    pass
+        print(f"[CodexBar] Start with Windows: {'on' if enabled else 'off'}")
+        return True
+    except (ImportError, OSError) as e:
+        print(f"[CodexBar] Start with Windows failed: {e}")
+        return False
+
+
 # ─────────────────────────────────────────────
 # Data fetcher
 # ─────────────────────────────────────────────
@@ -85,7 +143,7 @@ class ClaudeDataFetcher:
             "session_used_pct": 0, "session_reset": "unknown",
             "weekly_used_pct": 0, "weekly_reset": "unknown",
             "opus_used_pct": 0,
-            "cost_today": 0.0, "cost_today_tokens": "0",
+            "cost_today": 0.0, "cost_today_tokens": "0", "cost_today_known": False,
             "cost_30d": 0.0, "cost_30d_tokens": "0",
             "source": "none", "error": None,
             "installed": False,
@@ -130,6 +188,7 @@ class ClaudeDataFetcher:
         if cost:
             self.data["cost_today"] = cost["cost_today"]
             self.data["cost_today_tokens"] = cost["cost_today_tokens"]
+            self.data["cost_today_known"] = cost["cost_today_known"]
             self.data["cost_30d"] = cost["cost_30d"]
             self.data["cost_30d_tokens"] = cost["cost_30d_tokens"]
             if self.data["source"] == "none":
@@ -585,6 +644,7 @@ class ClaudeDataFetcher:
 
         return {
             "cost_today": round(ct,2), "cost_today_tokens": fmt(today_in+today_out),
+            "cost_today_known": today_in + today_out > 0,
             "cost_30d": round(c30,2), "cost_30d_tokens": fmt(total_in+total_out+total_cache),
         }
 
@@ -678,7 +738,7 @@ class CodexDataFetcher:
             "updated": "Never", "source": "none",
             "session_used_pct": 0, "session_reset": "unknown",
             "weekly_used_pct": 0, "weekly_reset": "unknown",
-            "cost_today": 0, "cost_today_tokens": "0",
+            "cost_today": 0, "cost_today_tokens": "0", "cost_today_known": False,
             "cost_30d": 0, "cost_30d_tokens": "0",
             "model": "",
             "error": None, "available": False,
@@ -720,6 +780,9 @@ class CodexDataFetcher:
         # live quota wins: the local snapshot above is only a fallback
         if self._fetch_live_usage(d):
             d["source"] = "api"
+
+        # pi agent is where the usage really happens: priced in its own logs
+        self._pi_cost(d)
 
         d["updated"] = datetime.now().strftime("Updated %H:%M")
         return d
@@ -786,8 +849,8 @@ class CodexDataFetcher:
             d["source"] = "config"
             return
 
-        # shortcut: .jsonl.zst rollouts are not read (no zstd in stdlib), so the
-        # cost below is a lower bound; upgrade if codex stops writing plain jsonl
+        # shortcut: .jsonl.zst rollouts are not read (no zstd in stdlib), so this
+        # quota fallback can be stale; upgrade if codex stops writing plain jsonl
         skipped = len(list(sessions_dir.rglob("*.jsonl.zst")))
         print(f"    Codex: scanning {len(jsonl_files)} session files"
               + (f" ({skipped} compressed rollouts skipped)" if skipped else ""))
@@ -825,51 +888,55 @@ class CodexDataFetcher:
         else:
             d["source"] = "config"
 
-        # sum token usage across all sessions for cost estimate
-        total_in = total_out = total_cached = 0
-        today_in = today_out = today_cached = 0
-        today = datetime.now().date()
+    @classmethod
+    def _pi_cost(cls, d):
+        """Cost and tokens from pi agent's own session logs.
 
-        for jf in jsonl_files:
+        pi prices every assistant message it stores (message.usage.cost.total),
+        so this is a measurement rather than an estimate.
+        """
+        sessions = Path.home() / '.pi' / 'agent' / 'sessions'
+        since = datetime.now().date() - timedelta(days=30)
+        today = datetime.now().date().isoformat()
+        today_cost = total_cost = 0.0
+        today_tokens = total_tokens = 0
+
+        for path in sessions.rglob('*.jsonl') if sessions.exists() else ():
             try:
-                tokens = self._extract_total_tokens(jf)
-                if not tokens:
+                if datetime.fromtimestamp(path.stat().st_mtime).date() < since:
                     continue
-                inp = tokens.get("input_tokens", 0)
-                out = tokens.get("output_tokens", 0)
-                cached = tokens.get("cached_input_tokens", 0)  # already counted inside input_tokens
-                total_in += inp
-                total_out += out
-                total_cached += cached
-
-                # check if file is from today
-                try:
-                    ts_str = jf.stem.split("rollout-")[1][:10]  # "2026-03-22"
-                    if datetime.strptime(ts_str, "%Y-%m-%d").date() == today:
-                        today_in += inp
-                        today_out += out
-                        today_cached += cached
-                except Exception:
-                    pass
-            except Exception:
+                with open(path, encoding='utf-8', errors='ignore') as fh:
+                    for line in fh:
+                        if '"cost"' not in line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+                        usage = (entry.get('message') or {}).get('usage') or {}
+                        spent = (usage.get('cost') or {}).get('total')
+                        if spent is None:
+                            continue
+                        tokens = usage.get('totalTokens') or 0
+                        total_cost += spent
+                        total_tokens += tokens
+                        if str(entry.get('timestamp', ''))[:10] == today:
+                            today_cost += spent
+                            today_tokens += tokens
+            except OSError:
                 continue
 
-        # gpt-4o class: $2.50/M input, $1.25/M cached input, $10/M output
-        def cost(inp, cached, out):
-            return ((inp - cached) * 2.5 + cached * 1.25 + out * 10) / 1e6
+        d["cost_today"] = round(today_cost, 2)
+        d["cost_today_tokens"] = cls._fmt_tokens(today_tokens)
+        d["cost_today_known"] = today_tokens > 0
+        d["cost_30d"] = round(total_cost, 2)
+        d["cost_30d_tokens"] = cls._fmt_tokens(total_tokens)
 
-        c30 = cost(total_in, total_cached, total_out)
-        ct = cost(today_in, today_cached, today_out)
-
-        def fmt(n):
-            if n >= 1e6: return f"{n / 1e6:.1f}M"
-            if n >= 1e3: return f"{n / 1e3:.0f}K"
-            return str(n)
-
-        d["cost_today"] = round(ct, 2)
-        d["cost_today_tokens"] = fmt(today_in + today_out)
-        d["cost_30d"] = round(c30, 2)
-        d["cost_30d_tokens"] = fmt(total_in + total_out)
+    @staticmethod
+    def _fmt_tokens(n):
+        if n >= 1e6: return f"{n / 1e6:.1f}M"
+        if n >= 1e3: return f"{n / 1e3:.0f}K"
+        return str(n)
 
     @staticmethod
     def _extract_rate_limits(jsonl_path):
@@ -894,28 +961,6 @@ class CodexDataFetcher:
             pass
         return last
 
-    @staticmethod
-    def _extract_total_tokens(jsonl_path):
-        """Return total_token_usage from the last token_count entry."""
-        last = None
-        try:
-            with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line or "total_token_usage" not in line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                        p = e.get("payload", {})
-                        if isinstance(p, dict) and p.get("type") == "token_count":
-                            t = p.get("info", {}).get("total_token_usage")
-                            if t:
-                                last = t
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return last
 
     @staticmethod
     def _format_reset(epoch):
@@ -1285,6 +1330,8 @@ class CodexBarPopup(ctk.CTkToplevel):
         wp = d["weekly_used_pct"]
         op = d["opus_used_pct"]
         has_data = d["source"] != "none"
+        # logs only carry the cost: without cli/api the quota is unknown, not 0
+        has_quota = d["source"] in ("cli", "api")
         has_cost = d["cost_today"] > 0 or d["cost_30d"] > 0
 
         # warm gradient flare
@@ -1325,8 +1372,8 @@ class CodexBarPopup(ctk.CTkToplevel):
             ctk.CTkLabel(parent, text="Usage", font=("Segoe UI Semibold", 13),
                          text_color=self.CL_TERTIARY,
                          anchor="w").pack(fill="x", padx=22, pady=(10, 2))
-            self._cl_usage_bar(parent, "Session", sp, d["session_reset"])
-            self._cl_usage_bar(parent, "Weekly", wp, d["weekly_reset"])
+            self._cl_usage_bar(parent, "Session", sp if has_quota else None, d["session_reset"])
+            self._cl_usage_bar(parent, "Weekly", wp if has_quota else None, d["weekly_reset"])
             if op > 0:
                 self._cl_usage_bar(parent, "Opus", op)
 
@@ -1345,7 +1392,7 @@ class CodexBarPopup(ctk.CTkToplevel):
             card.pack(fill="x", padx=20, pady=(0, 2))
             inner = ctk.CTkFrame(card, fg_color="transparent")
             inner.pack(fill="x", padx=14, pady=10)
-            for label, val in [("Today", f"${d['cost_today']:.2f}"),
+            for label, val in [("Today", _cost_today_text(d)),
                                ("Last 30 days", f"${d['cost_30d']:.2f}")]:
                 r = ctk.CTkFrame(inner, fg_color="transparent")
                 r.pack(fill="x", pady=1)
@@ -1384,21 +1431,24 @@ class CodexBarPopup(ctk.CTkToplevel):
 
         ctk.CTkFrame(parent, fg_color="transparent", height=6).pack(fill="x")
 
-    def _cl_usage_bar(self, parent, label, pct, reset=None):
-        color = self._cl_bar_color(pct)
+    def _cl_usage_bar(self, parent, label, used, reset=None):
+        left = None if used is None else 100 - used  # the bar shows what is left
+        color = self.CL_TERTIARY if left is None else self._cl_bar_color(used)
         sec = ctk.CTkFrame(parent, fg_color="transparent")
         sec.pack(fill="x", padx=20, pady=(3, 2))
         row = ctk.CTkFrame(sec, fg_color="transparent")
         row.pack(fill="x")
         ctk.CTkLabel(row, text=label, font=("Segoe UI Semibold", 13),
                      text_color=self.CL_PRIMARY).pack(side="left")
-        ctk.CTkLabel(row, text=f"{pct}%", font=("Segoe UI Semibold", 13),
+        ctk.CTkLabel(row, text="—" if left is None else f"{left}% left",
+                     font=("Segoe UI Semibold", 13),
                      text_color=color).pack(side="right")
         track = ctk.CTkFrame(sec, fg_color=self.CL_TRACK, height=8, corner_radius=4)
         track.pack(fill="x", pady=(4, 3))
         track.pack_propagate(False)
         ctk.CTkFrame(track, fg_color=color, corner_radius=4, height=8).place(
-            relx=0, rely=0, relwidth=max(pct / 100, 0.015), relheight=1)
+            relx=0, rely=0, relwidth=0 if left is None else max(left / 100, 0.015),
+            relheight=1)
         if reset and reset != "unknown":
             ctk.CTkLabel(sec, text=f"Resets {reset}", font=("Segoe UI", 11),
                          text_color=self.CL_TERTIARY, anchor="w").pack(fill="x")
@@ -1485,11 +1535,11 @@ class CodexBarPopup(ctk.CTkToplevel):
         if has_cost:
             ctk.CTkFrame(parent, fg_color=self.OA_DIVIDER,
                          height=1, corner_radius=0).pack(fill="x", padx=20, pady=(8, 0))
-            ctk.CTkLabel(parent, text="API Cost Estimate",
+            ctk.CTkLabel(parent, text="pi Agent Cost",
                          font=("Segoe UI Semibold", 13),
                          text_color=self.OA_TERTIARY,
                          anchor="w").pack(fill="x", padx=22, pady=(10, 0))
-            ctk.CTkLabel(parent, text="Estimated API equivalent — not billed",
+            ctk.CTkLabel(parent, text="Priced by pi from real token usage — not billed",
                          font=("Segoe UI", 10),
                          text_color=self.OA_TERTIARY,
                          anchor="w").pack(fill="x", padx=22, pady=(0, 4))
@@ -1497,8 +1547,8 @@ class CodexBarPopup(ctk.CTkToplevel):
             card.pack(fill="x", padx=20, pady=(0, 2))
             inner = ctk.CTkFrame(card, fg_color="transparent")
             inner.pack(fill="x", padx=14, pady=10)
-            for label, val in [("Today", f"${d['cost_today']:.2f}"),
-                               ("All sessions", f"${d['cost_30d']:.2f}")]:
+            for label, val in [("Today", _cost_today_text(d)),
+                               ("Last 30 days", f"${d['cost_30d']:.2f}")]:
                 r = ctk.CTkFrame(inner, fg_color="transparent")
                 r.pack(fill="x", pady=1)
                 ctk.CTkLabel(r, text=label, font=("Segoe UI", 12),
@@ -1519,21 +1569,22 @@ class CodexBarPopup(ctk.CTkToplevel):
 
         ctk.CTkFrame(parent, fg_color="transparent", height=6).pack(fill="x")
 
-    def _oa_usage_bar(self, parent, label, pct, reset=None):
-        color = self._oa_bar_color(pct)
+    def _oa_usage_bar(self, parent, label, used, reset=None):
+        left = 100 - used  # the bar shows what is left, not what is spent
+        color = self._oa_bar_color(used)
         sec = ctk.CTkFrame(parent, fg_color="transparent")
         sec.pack(fill="x", padx=20, pady=(3, 2))
         row = ctk.CTkFrame(sec, fg_color="transparent")
         row.pack(fill="x")
         ctk.CTkLabel(row, text=label, font=("Segoe UI Semibold", 13),
                      text_color=self.OA_PRIMARY).pack(side="left")
-        ctk.CTkLabel(row, text=f"{pct}%", font=("Segoe UI Semibold", 13),
+        ctk.CTkLabel(row, text=f"{left}% left", font=("Segoe UI Semibold", 13),
                      text_color=color).pack(side="right")
         track = ctk.CTkFrame(sec, fg_color=self.OA_TRACK, height=8, corner_radius=4)
         track.pack(fill="x", pady=(4, 3))
         track.pack_propagate(False)
         ctk.CTkFrame(track, fg_color=color, corner_radius=4, height=8).place(
-            relx=0, rely=0, relwidth=max(pct / 100, 0.015), relheight=1)
+            relx=0, rely=0, relwidth=max(left / 100, 0.015), relheight=1)
         if reset and reset != "unknown":
             ctk.CTkLabel(sec, text=f"Resets {reset}", font=("Segoe UI", 11),
                          text_color=self.OA_TERTIARY, anchor="w").pack(fill="x")
@@ -1556,7 +1607,7 @@ class CodexBarPopup(ctk.CTkToplevel):
             hover_color=self.CL_HOVER, anchor="w", height=30,
             corner_radius=8, width=80,
             command=lambda: self._open_url(
-                "https://platform.openai.com/usage" if self._active_tab == "openai"
+                "https://chatgpt.com/settings/usage?tab=overview" if self._active_tab == "openai"
                 else "https://claude.ai/settings/billing"))
         self._dash_btn.pack(side="left", padx=2)
 
@@ -1659,11 +1710,13 @@ class CodexBarApp:
         menu = Menu(
             MenuItem('Open CodexBar', self._tray_open, default=True),
             MenuItem('Refresh', self._tray_refresh),
+            MenuItem('Start with Windows', self._toggle_startup,
+                     checked=lambda _item: startup_enabled()),
             Menu.SEPARATOR,
             MenuItem('Quit', self._tray_quit),
         )
         self.tray = pystray.Icon('CodexBar', make_icon(sl, wl, provider=self.active_provider),
-                                 'CodexBar', menu)
+                                 self._tooltip_text(), menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
 
         # ── auto-refresh every 5 min ──
@@ -1686,6 +1739,13 @@ class CodexBarApp:
 
     def _tray_refresh(self, *_):
         self.root.after(0, self._do_refresh)
+
+    def _toggle_startup(self, *_):
+        set_startup(not startup_enabled())
+        try:
+            self.tray.update_menu()
+        except Exception:
+            pass
 
     def _tray_quit(self, *_):
         self.root.after(0, self._do_quit)
@@ -1718,17 +1778,52 @@ class CodexBarApp:
         self.active_provider = "openai" if tab == "openai" else "claude"
         self._set_tray_icon(self.active_provider)
 
+    def _tooltip_text(self):
+        """Tray tooltip: what is left on both windows of the provider on screen."""
+        if self.active_provider == "openai":
+            d, name = self.codex_data, "Codex"
+            known = (d or {}).get("source") in ("api", "sessions")
+        else:
+            d, name = self.fetcher.data, "Claude"
+            known = (d or {}).get("source") in ("cli", "api")
+        parts = [f"{label} {100 - d[key]}% left"
+                 for label, key in (("5h", "session_used_pct"), ("weekly", "weekly_used_pct"))
+                 if known and (d or {}).get(key) is not None]
+        return f"CodexBar — {name}: " + " · ".join(parts) if parts else f"CodexBar — {name}"
+
     def _set_tray_icon(self, provider):
         try:
             p = "openai" if provider == "openai" else "claude"
             self.tray.icon = make_icon(provider=p)
+            self.tray.title = self._tooltip_text()
         except Exception:
             pass
 
     # ── refresh ──
 
+    ALERT_AT = (80, 95)  # % of a quota window used
+
+    def _alert_crossings(self, before, after, provider):
+        """Notify each window that crossed an alert threshold since `before`.
+
+        Comparing against the previous value keeps it quiet on repeat refreshes:
+        a reset drops the percentage, which re-arms the next crossing.
+        """
+        for label, key in (("5h", "session_used_pct"), ("weekly", "weekly_used_pct")):
+            prev = (before or {}).get(key, 0)
+            now = (after or {}).get(key, 0)
+            crossed = [t for t in self.ALERT_AT if prev < t <= now]
+            if crossed:
+                print(f"[CodexBar] Alert: {provider} {label} at {now}% (threshold {max(crossed)}%)")
+                try:
+                    self.tray.notify(f"{provider} {label} limit: {now}% used", "CodexBar")
+                except Exception:
+                    pass
+
     def _do_refresh(self):
         def bg():
+            claude_before = dict(self.fetcher.data)  # fetch_all mutates the same dict
+            codex_before = self.codex_data
             self.fetcher.fetch_all()
             try:
                 self.codex_data = self.codex_fetcher.fetch()
@@ -1741,7 +1836,10 @@ class CodexBarApp:
                 (100 - d["session_used_pct"]) / 100,
                 (100 - d["weekly_used_pct"]) / 100,
                 provider=self.active_provider)
+            self.tray.title = self._tooltip_text()
             print("[CodexBar] Refreshed")
+            self._alert_crossings(claude_before, d, "Claude")
+            self._alert_crossings(codex_before, self.codex_data, "Codex")
         threading.Thread(target=bg, daemon=True).start()
 
     def _auto_refresh(self):
