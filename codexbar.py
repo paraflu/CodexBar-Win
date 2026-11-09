@@ -14,6 +14,8 @@ import sys
 import json
 import time
 import re
+import math
+import tempfile
 import shutil
 import threading
 import ctypes
@@ -23,6 +25,180 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+
+
+def _reset_timestamp(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _window_seconds(blob):
+    if not isinstance(blob, dict):
+        return None
+    for key, multiplier in (("limit_window_seconds", 1), ("window_seconds", 1), ("window_minutes", 60)):
+        try:
+            value = float(blob[key]) * multiplier
+            if math.isfinite(value) and value > 0:
+                return value
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None
+
+
+
+def _quota_forecast(used_pct, reset_at, observed_at, window_seconds, now=None):
+    """Project average usage to reset; return None when timing is unreliable."""
+    try:
+        used_pct = float(used_pct)
+        reset_at = float(reset_at)
+        observed_at = float(observed_at)
+        window_seconds = float(window_seconds)
+        now = time.time() if now is None else float(now)
+    except (TypeError, ValueError):
+        return None
+    if not all(map(math.isfinite, (used_pct, reset_at, observed_at, now, window_seconds))):
+        return None
+    if not 0 <= used_pct <= 100 or reset_at <= now or observed_at > now or now - observed_at > 600:
+        return None
+    remaining = reset_at - now
+    elapsed = window_seconds - (reset_at - observed_at)
+    if elapsed < max(600, window_seconds * 0.05) or remaining >= window_seconds:
+        return None
+    projected = used_pct * window_seconds / elapsed
+    if not math.isfinite(projected):
+        return None
+    return projected, elapsed, remaining
+
+
+
+def _quota_guidance(used, projected):
+    if used >= 100 or projected > 100:
+        return "Rallenta: al ritmo attuale supererai il limite"
+    if projected >= 80:
+        return "In linea: mantieni il ritmo"
+    return "Puoi accelerare: la proiezione resta sotto l'80%"
+
+
+
+def _quota_forecast_display(used, reset_at, observed_at, duration, text_color, now=None):
+    result = _quota_forecast(used, reset_at, observed_at, duration, now)
+    if result is None:
+        return "Previsione non disponibile: durata o reset non affidabili", text_color
+    projected = result[0]
+    warning = projected > 100
+    return (f"Proiezione: {projected:.0f}% al reset · {_quota_guidance(used, projected)}",
+            "#F0A43B" if warning else text_color)
+
+
+
+def _record_quota_sample(history, data, now=None):
+    now = time.time() if now is None else now
+    if data.get("source") != "api":
+        return False
+    recorded = False
+    for name, prefix in (("session", "session"), ("weekly", "weekly")):
+        try:
+            used = float(data[f"{prefix}_used_pct"])
+            reset_at = float(data[f"{prefix}_reset_at"])
+            observed_at = float(data[f"{prefix}_observed_at"])
+            duration = float(data[f"{prefix}_window_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (not all(map(math.isfinite, (used, reset_at, observed_at, duration)))
+                or not 0 <= used <= 100 or duration <= 0 or observed_at > now
+                or now - observed_at > 180 or reset_at <= now
+                or reset_at - observed_at > duration):
+            continue
+        samples = history[name]
+        if samples and (abs(samples[-1]["reset_at"] - reset_at) > 120
+                        or samples[-1]["duration"] != duration):
+            samples.clear()
+        if samples and observed_at <= samples[-1]["at"]:
+            continue
+        samples.append({"at": observed_at, "used": used,
+                        "reset_at": reset_at, "duration": duration})
+        del samples[:-10080]
+        recorded = True
+    return recorded
+
+
+def _quota_change_text(samples, now=None, poll="~1 min"):
+    if len(samples) < 2:
+        return f"Raccolta da avvio · quota account aggregata · poll {poll}"
+    now = time.time() if now is None else now
+    previous, latest = samples[-2:]
+    minutes = max(1, round((latest["at"] - previous["at"]) / 60))
+    age_minutes = max(0, round((now - latest["at"]) / 60))
+    age = "ora" if age_minutes <= 1 else f"{age_minutes} min fa"
+    delta = latest["used"] - previous["used"]
+    return f"Variazione account: {delta:+.0f} punti in {minutes} min · ultimo campione {age} · dati da avvio · poll {poll}"
+
+
+def _check_quota_forecast():
+    now = 1_700_000_000
+    assert math.isclose(_quota_forecast(20, now + 4 * 3600, now, 5 * 3600, now)[0], 100)
+    assert math.isclose(_quota_forecast(10, now + 2 * 86400, now, 7 * 86400, now)[0], 14)
+    assert _quota_forecast(0, now + 4 * 3600, now, 5 * 3600, now)[0] == 0
+    assert math.isclose(_quota_forecast(90, now + 4 * 3600, now, 5 * 3600, now)[0], 450)
+    assert math.isclose(_quota_forecast(30, now + 1800, now, 3600, now)[0], 60)
+    assert math.isclose(_window_seconds({"limit_window_seconds": 3600}), 3600)
+    assert math.isclose(_window_seconds({"window_minutes": 180}), 10800)
+    assert _window_seconds({}) is None
+    assert _quota_forecast(20, None, now, 5 * 3600, now) is None
+    assert _quota_forecast(20, now, now, 5 * 3600, now) is None
+    assert _quota_forecast(20, now + 4 * 3600 + 55 * 60, now, 5 * 3600, now) is None
+    assert _quota_forecast(20, now + 3600, now - 601, 5 * 3600, now) is None
+    assert math.isclose(_quota_forecast(100, now + 3600, now, 5 * 3600, now)[0], 125)
+    assert _quota_guidance(100, 125).startswith("Rallenta")
+    assert _quota_guidance(90, 95).startswith("In linea")
+    assert _quota_guidance(20, 40).startswith("Puoi accelerare")
+    overrun, overrun_color = _quota_forecast_display(25, now + 4 * 3600, now, 5 * 3600, "#ccc", now)
+    assert "125%" in overrun and overrun_color == "#F0A43B"
+    assert _quota_forecast(10, now - 1, now, 5 * 3600, now) is None
+    assert _quota_forecast(101, now + 3600, now, 5 * 3600, now) is None
+    history = {"session": [], "weekly": []}
+    sample = {"source": "api", "session_used_pct": 10, "weekly_used_pct": 40,
+              "session_reset_at": now + 4 * 3600, "weekly_reset_at": now + 2 * 86400,
+              "session_observed_at": now, "weekly_observed_at": now,
+              "session_window_seconds": 5 * 3600, "weekly_window_seconds": 7 * 86400}
+    assert _record_quota_sample(history, sample, now)
+    sample = dict(sample, session_used_pct=15, weekly_used_pct=42,
+                  session_observed_at=now + 60, weekly_observed_at=now + 60)
+    assert _record_quota_sample(history, sample, now + 60)
+    assert "+5 punti" in _quota_change_text(history["session"])
+    assert "+2 punti" in _quota_change_text(history["weekly"])
+    assert not _record_quota_sample(history, dict(sample, source="sessions"), now + 60)
+    assert not _record_quota_sample(history, dict(sample, session_observed_at=now - 181), now + 60)
+    sample = dict(sample, session_used_pct=16, session_observed_at=now + 180)
+    assert _record_quota_sample(history, sample, now + 180)
+    assert "in 2 min" in _quota_change_text(history["session"], now + 180)
+    sample = dict(sample, session_reset_at=now + 4 * 3600 + 600,
+                  session_observed_at=now + 240)
+    assert _record_quota_sample(history, sample, now + 240)
+    assert len(history["session"]) == 1
+    with tempfile.TemporaryDirectory() as directory:
+        event_at = "2023-11-14T22:13:20Z"
+        event = {"timestamp": event_at, "payload": {"type": "token_count", "rate_limits": {
+            "primary": {"used_percent": 25, "resets_at": now + 3600, "window_minutes": 300}}}}
+        path = Path(directory) / "session.jsonl"
+        path.write_text(json.dumps(event), encoding="utf-8")
+        limits, observed_at = CodexDataFetcher._extract_rate_limits(path)
+        assert limits["primary"]["window_minutes"] == 300
+        assert observed_at == _reset_timestamp(event_at)
+        assert math.isclose(_quota_forecast(25, now + 3600, observed_at,
+                                            _window_seconds(limits["primary"]), now)[0], 31.25)
+        event.pop("timestamp")
+        path.write_text(json.dumps(event), encoding="utf-8")
+        _, observed_at = CodexDataFetcher._extract_rate_limits(path)
+        assert observed_at is None
+        assert _quota_forecast(25, now + 3600, observed_at, 18000, now) is None
+
+
 
 if getattr(sys, 'frozen', False):
     # The PyInstaller windowed exe has no console: keep the diagnostics on disk.
@@ -140,8 +316,10 @@ class ClaudeDataFetcher:
     def _empty(self):
         return {
             "provider": "Claude", "plan": "Unknown", "updated": "Never",
-            "session_used_pct": 0, "session_reset": "unknown",
-            "weekly_used_pct": 0, "weekly_reset": "unknown",
+            "session_used_pct": 0, "session_reset": "unknown", "session_reset_at": None,
+            "session_observed_at": None, "weekly_used_pct": 0, "weekly_reset": "unknown",
+            "weekly_reset_at": None, "weekly_observed_at": None,
+            "session_window_seconds": None, "weekly_window_seconds": None,
             "opus_used_pct": 0,
             "cost_today": 0.0, "cost_today_tokens": "0", "cost_today_known": False,
             "cost_30d": 0.0, "cost_30d_tokens": "0",
@@ -415,7 +593,7 @@ class ClaudeDataFetcher:
                 return None
 
             # pre-fill plan from local credentials (no network needed)
-            tier = oauth.get("rateLimitTier") or oauth.get("subscriptionType") or ""
+            tier = oauth.get("subscriptionType") or oauth.get("rateLimitTier") or ""
             plan_local = tier.replace("default_claude_", "").replace("_", " ").title() or "Pro"
 
             print(f"    OAuth token found ({len(token)} chars), plan hint: {plan_local}")
@@ -423,11 +601,7 @@ class ClaudeDataFetcher:
             print(f"    OAuth creds err: {e}")
             return None
 
-        result = self._call_claude_api(
-            auth_header=("Authorization", f"Bearer {token}"),
-            plan_hint=plan_local,
-            source_label="api",
-        )
+        result = self._call_claude_api(token, plan_local)
         # Even if the API call failed, populate plan from local creds
         if result is None and plan_local:
             self.data["plan"] = plan_local
@@ -435,161 +609,33 @@ class ClaudeDataFetcher:
 
     # ── shared API call logic ──────────────────
 
-    def _call_claude_api(self, *, auth_header, plan_hint, source_label):
-        """GET /organizations → /usage using the given auth header.
-
-        ``auth_header`` is a (name, value) tuple, e.g.
-        ("Authorization", "Bearer …").
-        """
-        headers = {
-            auth_header[0]: auth_header[1],
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-        }
-
-        # step 1: get organizations
+    def _call_claude_api(self, token, plan_hint):
+        """GET the OAuth usage endpoint Claude Code uses: 5h and 7d windows."""
+        req = Request("https://api.anthropic.com/api/oauth/usage",
+                      headers={"Authorization": f"Bearer {token}",
+                               "anthropic-beta": "oauth-2025-04-20",
+                               "User-Agent": "Mozilla/5.0"})
         try:
-            req = Request("https://api.claude.ai/api/organizations",
-                          headers=headers)
-            with urlopen(req, timeout=15) as resp:
-                orgs = json.loads(resp.read())
-        except (URLError, HTTPError, json.JSONDecodeError) as e:
-            print(f"    API /organizations err: {e}")
-            return None
-
-        if not isinstance(orgs, list) or len(orgs) == 0:
-            print("    API: empty org list")
-            return None
-
-        org = orgs[0]
-        org_id = org.get("uuid") or org.get("id") or org.get("organization_id")
-        if not org_id:
-            print(f"    API: no org id in {list(org.keys())}")
-            return None
-        print(f"    Org: {org.get('name', '?')} ({org_id[:12]}...)")
-
-        # step 2: get usage
-        try:
-            req = Request(
-                f"https://api.claude.ai/api/organizations/{org_id}/usage",
-                headers=headers)
             with urlopen(req, timeout=15) as resp:
                 usage = json.loads(resp.read())
         except (URLError, HTTPError, json.JSONDecodeError) as e:
-            print(f"    API /usage err: {e}")
+            print(f"    API usage err: {e}")
             return None
-
-        return self._parse_api_usage(usage, org, plan_hint, source_label)
-
-    def _parse_api_usage(self, usage, org, plan_hint=None, source_label="api"):
-        """Turn the /usage JSON into our standard data dict.
-
-        The response structure is not publicly documented, so this
-        tries several known field patterns defensively.
-        """
         d = self._empty()
-        d["source"] = source_label
-
-        # plan name: prefer org data, then local hint
-        plan_found = False
-        for key in ("rate_limit_tier", "plan", "billing_type"):
-            v = org.get(key)
-            if v:
-                d["plan"] = str(v).replace("_", " ").replace("default claude ", "").title()
-                plan_found = True
-                break
-        if not plan_found and plan_hint:
-            d["plan"] = plan_hint
-
-        # ── helper: dig a percentage out of a sub-dict ──
-        def pct_from(blob, *keys):
-            """Return an int 0-100 or None."""
-            if blob is None:
-                return None
-            # direct "X_pct" / "X_percent" / "X_percentage" field
-            for k in keys:
-                for suffix in ("_pct", "_percent", "_percentage", "_used_pct"):
-                    v = blob.get(f"{k}{suffix}")
-                    if v is not None:
-                        return max(0, min(100, int(v)))
-            # compute from used / limit
-            used = blob.get("used") or blob.get("tokens_used") or 0
-            limit = blob.get("limit") or blob.get("max_tokens") or blob.get("allowed") or 0
-            if limit > 0:
-                return max(0, min(100, int(used / limit * 100)))
-            return None
-
-        def reset_from(blob):
-            """Return a human string like '3h 20m' or None."""
-            if blob is None:
-                return None
-            for k in ("reset_at", "resets_at", "reset_time", "expires_at"):
-                v = blob.get(k)
-                if not v:
-                    continue
-                try:
-                    dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-                    delta = dt - datetime.now(dt.tzinfo)
-                    secs = max(0, int(delta.total_seconds()))
-                    h, m = divmod(secs // 60, 60)
-                    if h >= 24:
-                        return f"{h // 24}d {h % 24}h"
-                    return f"{h}h {m:02d}m"
-                except Exception:
-                    pass
-            return None
-
-        # The API may return:
-        #   {"daily_usage": {...}, "monthly_usage": {...}}
-        #   {"session_limit": {...}, "weekly_limit": {...}}
-        #   {"messageLimit": {"remaining": N, ...}}
-        #   or a flat dict with percentage fields
-
-        # try nested blobs first
-        session_blob = (usage.get("daily_usage")
-                        or usage.get("session_limit")
-                        or usage.get("session")
-                        or usage.get("messageLimit"))
-        weekly_blob  = (usage.get("monthly_usage")
-                        or usage.get("weekly_limit")
-                        or usage.get("weekly")
-                        or usage.get("longTermUsage"))
-
-        sp = pct_from(session_blob, "daily", "session", "message", "used")
-        wp = pct_from(weekly_blob,  "monthly", "weekly", "long_term", "used")
-
-        # if nothing nested, try flat fields
-        if sp is None:
-            sp = pct_from(usage, "daily", "session", "message")
-        if wp is None:
-            wp = pct_from(usage, "monthly", "weekly", "long_term")
-
-        # remaining-based: messageLimit.remaining / total
-        if sp is None and isinstance(session_blob, dict):
-            rem = session_blob.get("remaining")
-            tot = session_blob.get("total") or session_blob.get("limit")
-            if rem is not None and tot:
-                sp = max(0, min(100, int((1 - rem / tot) * 100)))
-
-        if sp is not None:
-            d["session_used_pct"] = sp
-        if wp is not None:
-            d["weekly_used_pct"] = wp
-
-        sr = reset_from(session_blob) or reset_from(usage)
-        wr = reset_from(weekly_blob)
-        if sr:
-            d["session_reset"] = sr
-        if wr:
-            d["weekly_reset"] = wr
-
-        # debug: show raw keys so user can report the shape
-        print(f"    API usage keys: {list(usage.keys())}")
-        if session_blob and isinstance(session_blob, dict):
-            print(f"    session blob keys: {list(session_blob.keys())}")
-
+        d["source"] = "api"
+        d["plan"] = plan_hint
+        observed = time.time()
+        for prefix, key, window in (("session", "five_hour", 5 * 3600), ("weekly", "seven_day", 7 * 86400)):
+            blob = usage.get(key) or {}
+            d[f"{prefix}_used_pct"] = max(0, min(100, int(blob.get("utilization") or 0)))
+            stamp = _reset_timestamp(blob.get("resets_at"))
+            d[f"{prefix}_reset_at"] = stamp
+            d[f"{prefix}_observed_at"] = observed if stamp else None
+            d[f"{prefix}_window_seconds"] = window
+            if stamp:
+                d[f"{prefix}_reset"] = datetime.fromtimestamp(stamp).strftime("%a %H:%M")
+        opus = usage.get("seven_day_opus") or {}
+        d["opus_used_pct"] = max(0, min(100, int(opus.get("utilization") or 0)))
         return d
 
     def _fetch_jsonl(self):
@@ -736,13 +782,31 @@ class CodexDataFetcher:
         return {
             "provider": "Codex", "plan": "Plus",
             "updated": "Never", "source": "none",
-            "session_used_pct": 0, "session_reset": "unknown",
-            "weekly_used_pct": 0, "weekly_reset": "unknown",
+            "session_used_pct": 0, "session_reset": "unknown", "session_reset_at": None,
+            "session_observed_at": None, "weekly_used_pct": 0, "weekly_reset": "unknown",
+            "weekly_reset_at": None, "weekly_observed_at": None,
+            "session_window_seconds": None, "weekly_window_seconds": None,
             "cost_today": 0, "cost_today_tokens": "0", "cost_today_known": False,
             "cost_30d": 0, "cost_30d_tokens": "0",
             "model": "",
             "error": None, "available": False,
         }
+    def fetch_quota(self):
+        """Fetch only live quota for the one-minute activity sampler."""
+        if not self.CODEX_DIR.exists():
+            return None
+        data = self._empty()
+        data["available"] = True
+        if not self._fetch_live_usage(data):
+            return None
+        if any(data.get(key) is None for key in (
+                "session_used_pct", "session_reset_at", "session_observed_at", "session_window_seconds",
+                "weekly_used_pct", "weekly_reset_at", "weekly_observed_at", "weekly_window_seconds")):
+            return None
+        data["source"] = "api"
+        data["updated"] = datetime.now().strftime("Updated %H:%M")
+        return data
+
 
     def fetch(self):
         d = self._empty()
@@ -795,13 +859,23 @@ class CodexDataFetcher:
             return False  # offline or token unusable: keep the local snapshot
 
         rl = usage.get("rate_limit") or {}
-        for key, pct, reset in (("primary_window", "session_used_pct", "session_reset"),
-                                ("secondary_window", "weekly_used_pct", "weekly_reset")):
+        observed_at = time.time()
+        for timing_key in ("session_reset_at", "session_observed_at", "session_window_seconds",
+                           "weekly_reset_at", "weekly_observed_at", "weekly_window_seconds"):
+            d[timing_key] = None
+        for key, pct, reset, reset_at_key, observed_key, duration_key in (
+            ("primary_window", "session_used_pct", "session_reset", "session_reset_at", "session_observed_at", "session_window_seconds"),
+            ("secondary_window", "weekly_used_pct", "weekly_reset", "weekly_reset_at", "weekly_observed_at", "weekly_window_seconds"),
+        ):
             window = rl.get(key) or {}
             if window:
                 d[pct] = int(window.get("used_percent", 0))
-                if window.get("reset_at"):
-                    d[reset] = self._format_reset(window["reset_at"])
+                stamp = _reset_timestamp(window.get("reset_at"))
+                d[reset_at_key] = stamp
+                d[duration_key] = _window_seconds(window)
+                d[observed_key] = observed_at if stamp else None
+                if stamp:
+                    d[reset] = self._format_reset(stamp)
         if usage.get("plan_type"):
             d["plan"] = usage["plan_type"].capitalize()
         return True
@@ -857,10 +931,11 @@ class CodexDataFetcher:
 
         # get rate limits from most recent file (last token_count entry)
         latest_limits = None
+        latest_limits_observed_at = None
         for jf in jsonl_files[:5]:  # check latest 5 files
             limits = self._extract_rate_limits(jf)
             if limits:
-                latest_limits = limits
+                latest_limits, latest_limits_observed_at = limits
                 break
 
         if latest_limits:
@@ -869,17 +944,23 @@ class CodexDataFetcher:
             primary = rl.get("primary", {})
             if primary:
                 d["session_used_pct"] = int(primary.get("used_percent", 0))
+                d["session_window_seconds"] = _window_seconds(primary)
                 resets_at = primary.get("resets_at")
                 if resets_at:
                     d["session_reset"] = self._format_reset(resets_at)
+                    d["session_reset_at"] = _reset_timestamp(resets_at)
+                    d["session_observed_at"] = latest_limits_observed_at
 
             # secondary = weekly window
             secondary = rl.get("secondary", {})
             if secondary:
                 d["weekly_used_pct"] = int(secondary.get("used_percent", 0))
+                d["weekly_window_seconds"] = _window_seconds(secondary)
                 resets_at = secondary.get("resets_at")
                 if resets_at:
                     d["weekly_reset"] = self._format_reset(resets_at)
+                    d["weekly_reset_at"] = _reset_timestamp(resets_at)
+                    d["weekly_observed_at"] = latest_limits_observed_at
 
             plan = rl.get("plan_type", "")
             if plan:
@@ -940,7 +1021,7 @@ class CodexDataFetcher:
 
     @staticmethod
     def _extract_rate_limits(jsonl_path):
-        """Return the last rate_limits dict from a JSONL file."""
+        """Return (rate_limits, event timestamp) from the latest quota event."""
         last = None
         try:
             with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -954,7 +1035,7 @@ class CodexDataFetcher:
                         if isinstance(p, dict) and p.get("type") == "token_count":
                             rl = p.get("rate_limits")
                             if rl:
-                                last = rl
+                                last = (rl, _reset_timestamp(e.get("timestamp")))
                     except Exception:
                         pass
         except Exception:
@@ -985,7 +1066,7 @@ class CodexBarPopup(ctk.CTkToplevel):
     """Borderless popup with Claude + OpenAI tabs and smooth transitions."""
 
     WIDTH = 370
-    FINAL_ALPHA = 0.94
+    FINAL_ALPHA = 1.0
 
     # ── Claude palette ──
     CL_BG       = "#FFFFFF"
@@ -1006,7 +1087,7 @@ class CodexBarPopup(ctk.CTkToplevel):
     OA_SURFACE  = "#2A2A2A"
     OA_PRIMARY  = "#ECECEC"
     OA_SECOND   = "#A0A0A0"
-    OA_TERTIARY = "#6E6E6E"
+    OA_TERTIARY = "#A0A0A0"
     OA_GREEN    = "#10A37F"
     OA_GREEN_LT = "#1A3A2F"
     OA_TRACK    = "#3A3A3A"
@@ -1016,10 +1097,15 @@ class CodexBarPopup(ctk.CTkToplevel):
 
     def __init__(self, master, claude_data, codex_data=None, *,
                  on_close=None, on_refresh=None, on_quit=None,
-                 on_tab_switch=None, initial_tab="claude"):
+                 on_tab_switch=None, initial_tab="claude", quota_history=None, claude_quota_history=None):
         super().__init__(master)
         self._claude = claude_data
         self._codex = codex_data or CodexDataFetcher._empty()
+        self._histories = {"openai": quota_history or {"session": [], "weekly": []},
+                           "claude": claude_quota_history or {"session": [], "weekly": []}}
+        self._charts = {}
+        self._quota_bar_refs = {}
+        self._forecast_labels = {}
         self._on_close = on_close
         self._on_refresh = on_refresh
         self._on_quit = on_quit
@@ -1245,6 +1331,16 @@ class CodexBarPopup(ctk.CTkToplevel):
 
     # ── bar colour helpers ──
 
+
+    def _usage_forecast(self, parent, used, reset_at, observed_at, window_seconds, text_color):
+        text, color = _quota_forecast_display(used, reset_at, observed_at,
+                                             window_seconds, text_color)
+        label = ctk.CTkLabel(parent, text=text, font=("Segoe UI", 10),
+                             text_color=color, anchor="w", wraplength=300,
+                             justify="left")
+        label.pack(fill="x", padx=2, pady=(3, 1))
+        return label
+
     @staticmethod
     def _cl_bar_color(pct):
         if pct <= 50:  return "#D97757"
@@ -1372,10 +1468,13 @@ class CodexBarPopup(ctk.CTkToplevel):
             ctk.CTkLabel(parent, text="Usage", font=("Segoe UI Semibold", 13),
                          text_color=self.CL_TERTIARY,
                          anchor="w").pack(fill="x", padx=22, pady=(10, 2))
-            self._cl_usage_bar(parent, "Session", sp if has_quota else None, d["session_reset"])
-            self._cl_usage_bar(parent, "Weekly", wp if has_quota else None, d["weekly_reset"])
+            self._cl_usage_bar(parent, "Session", sp if has_quota else None, d["session_reset"], d.get("session_window_seconds"), d.get("session_reset_at"), d.get("session_observed_at"))
+            self._cl_usage_bar(parent, "Weekly", wp if has_quota else None, d["weekly_reset"], d.get("weekly_window_seconds"), d.get("weekly_reset_at"), d.get("weekly_observed_at"))
             if op > 0:
                 self._cl_usage_bar(parent, "Opus", op)
+
+        if has_data:
+            self._build_activity_chart(parent, "claude")
 
         if has_cost:
             ctk.CTkFrame(parent, fg_color=self.CL_DIVIDER,
@@ -1431,8 +1530,8 @@ class CodexBarPopup(ctk.CTkToplevel):
 
         ctk.CTkFrame(parent, fg_color="transparent", height=6).pack(fill="x")
 
-    def _cl_usage_bar(self, parent, label, used, reset=None):
-        left = None if used is None else 100 - used  # the bar shows what is left
+    def _cl_usage_bar(self, parent, label, used, reset=None, window_seconds=None, reset_at=None, observed_at=None):
+        left = None if used is None else 100 - used
         color = self.CL_TERTIARY if left is None else self._cl_bar_color(used)
         sec = ctk.CTkFrame(parent, fg_color="transparent")
         sec.pack(fill="x", padx=20, pady=(3, 2))
@@ -1440,25 +1539,32 @@ class CodexBarPopup(ctk.CTkToplevel):
         row.pack(fill="x")
         ctk.CTkLabel(row, text=label, font=("Segoe UI Semibold", 13),
                      text_color=self.CL_PRIMARY).pack(side="left")
-        ctk.CTkLabel(row, text="—" if left is None else f"{left}% left",
-                     font=("Segoe UI Semibold", 13),
-                     text_color=color).pack(side="right")
+        remaining_label = ctk.CTkLabel(row, text="—" if left is None else f"{left}% left",
+                                        font=("Segoe UI Semibold", 13), text_color=color)
+        remaining_label.pack(side="right")
         track = ctk.CTkFrame(sec, fg_color=self.CL_TRACK, height=8, corner_radius=4)
         track.pack(fill="x", pady=(4, 3))
         track.pack_propagate(False)
-        ctk.CTkFrame(track, fg_color=color, corner_radius=4, height=8).place(
-            relx=0, rely=0, relwidth=0 if left is None else max(left / 100, 0.015),
-            relheight=1)
+        fill = ctk.CTkFrame(track, fg_color=color, corner_radius=4, height=8)
+        fill.place(relx=0, rely=0, relwidth=0 if left is None else max(left / 100, 0.015), relheight=1)
+        reset_label = None
         if reset and reset != "unknown":
-            ctk.CTkLabel(sec, text=f"Resets {reset}", font=("Segoe UI", 11),
-                         text_color=self.CL_TERTIARY, anchor="w").pack(fill="x")
-
+            reset_label = ctk.CTkLabel(sec, text=f"Resets {reset}", font=("Segoe UI", 11),
+                                       text_color=self.CL_SECOND, anchor="w")
+            reset_label.pack(fill="x")
+        if label != "Opus" and used is not None:
+            key = "weekly" if label == "Weekly" else "session"
+            self._quota_bar_refs[key] = (remaining_label, fill, reset_label)
+            self._forecast_labels[key] = self._usage_forecast(
+                sec, used, reset_at, observed_at, window_seconds, self.CL_SECOND)
     # ═══════════════════════════════════════
     # OPENAI PANEL — mirrors Claude layout
     # ═══════════════════════════════════════
 
     def _build_openai_panel(self, parent):
         d = self._codex
+        self._quota_bar_refs = {}
+        self._forecast_labels = {}
         available = d.get("available", False)
         sp = d["session_used_pct"]
         wp = d["weekly_used_pct"]
@@ -1500,6 +1606,10 @@ class CodexBarPopup(ctk.CTkToplevel):
                      text_color=self.OA_SECOND).pack(side="left")
         ctk.CTkLabel(meta, text=f"  {d['source']}", font=("Segoe UI", 11),
                      text_color=self.OA_TERTIARY).pack(side="left")
+        if available:
+            ctk.CTkLabel(hero, text="Scadenza abbonamento: non disponibile nei dati account",
+                         font=("Segoe UI", 10), text_color=self.OA_SECOND,
+                         anchor="w").pack(fill="x", pady=(2, 0))
 
         if not available:
             ctk.CTkFrame(parent, fg_color=self.OA_DIVIDER,
@@ -1529,8 +1639,11 @@ class CodexBarPopup(ctk.CTkToplevel):
             ctk.CTkLabel(parent, text="Usage", font=("Segoe UI Semibold", 13),
                          text_color=self.OA_TERTIARY,
                          anchor="w").pack(fill="x", padx=22, pady=(10, 2))
-            self._oa_usage_bar(parent, "Session (5h)", sp, d["session_reset"])
-            self._oa_usage_bar(parent, "Weekly", wp, d["weekly_reset"])
+            self._oa_usage_bar(parent, "Session (5h)", sp, d["session_reset"], d.get("session_window_seconds"), d.get("session_reset_at"), d.get("session_observed_at"))
+            self._oa_usage_bar(parent, "Weekly", wp, d["weekly_reset"], d.get("weekly_window_seconds"), d.get("weekly_reset_at"), d.get("weekly_observed_at"))
+
+        if available:
+            self._build_activity_chart(parent, "openai")
 
         if has_cost:
             ctk.CTkFrame(parent, fg_color=self.OA_DIVIDER,
@@ -1569,28 +1682,163 @@ class CodexBarPopup(ctk.CTkToplevel):
 
         ctk.CTkFrame(parent, fg_color="transparent", height=6).pack(fill="x")
 
-    def _oa_usage_bar(self, parent, label, used, reset=None):
-        left = 100 - used  # the bar shows what is left, not what is spent
-        color = self._oa_bar_color(used)
+    def _oa_usage_bar(self, parent, label, used, reset=None, window_seconds=None, reset_at=None, observed_at=None):
+        left = None if used is None else max(0, 100 - used)
+        color = self.OA_TERTIARY if left is None else self._oa_bar_color(used)
+        key = "weekly" if label == "Weekly" else "session"
         sec = ctk.CTkFrame(parent, fg_color="transparent")
         sec.pack(fill="x", padx=20, pady=(3, 2))
         row = ctk.CTkFrame(sec, fg_color="transparent")
         row.pack(fill="x")
         ctk.CTkLabel(row, text=label, font=("Segoe UI Semibold", 13),
                      text_color=self.OA_PRIMARY).pack(side="left")
-        ctk.CTkLabel(row, text=f"{left}% left", font=("Segoe UI Semibold", 13),
-                     text_color=color).pack(side="right")
+        remaining_label = ctk.CTkLabel(row, text="—" if left is None else f"{left}% left",
+                                        font=("Segoe UI Semibold", 13), text_color=color)
+        remaining_label.pack(side="right")
         track = ctk.CTkFrame(sec, fg_color=self.OA_TRACK, height=8, corner_radius=4)
         track.pack(fill="x", pady=(4, 3))
         track.pack_propagate(False)
-        ctk.CTkFrame(track, fg_color=color, corner_radius=4, height=8).place(
-            relx=0, rely=0, relwidth=max(left / 100, 0.015), relheight=1)
+        fill = ctk.CTkFrame(track, fg_color=color, corner_radius=4, height=8)
+        fill.place(relx=0, rely=0, relwidth=0 if left is None else max(left / 100, 0.015), relheight=1)
+        reset_label = None
         if reset and reset != "unknown":
-            ctk.CTkLabel(sec, text=f"Resets {reset}", font=("Segoe UI", 11),
-                         text_color=self.OA_TERTIARY, anchor="w").pack(fill="x")
+            reset_label = ctk.CTkLabel(sec, text=f"Resets {reset}", font=("Segoe UI", 11),
+                                       text_color=self.OA_SECOND, anchor="w")
+            reset_label.pack(fill="x")
+        self._quota_bar_refs[key] = (remaining_label, fill, reset_label)
+        if used is not None:
+            self._forecast_labels[key] = self._usage_forecast(
+                sec, used, reset_at, observed_at, window_seconds, self.OA_SECOND)
 
-    # ═══════════════════════════════════════
-    # FOOTER (shared between tabs)
+    def _chart_colors(self, name):
+        if name == "claude":
+            return {"card": self.CL_SURFACE, "primary": self.CL_PRIMARY, "second": self.CL_SECOND,
+                    "divider": self.CL_DIVIDER, "hover": self.CL_HOVER, "lite": self.CL_LITE,
+                    "line": self.CL_ACCENT}
+        return {"card": self.OA_CARD, "primary": self.OA_PRIMARY, "second": self.OA_SECOND,
+                "divider": self.OA_DIVIDER, "hover": self.OA_HOVER, "lite": self.OA_GREEN_LT,
+                "line": self.OA_GREEN}
+
+    def _build_activity_chart(self, parent, name):
+        c = self._chart_colors(name)
+        card = ctk.CTkFrame(parent, fg_color=c["card"], corner_radius=10)
+        card.pack(fill="x", padx=20, pady=(8, 2))
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(9, 2))
+        ctk.CTkLabel(header, text="Attività quota", font=("Segoe UI Semibold", 12),
+                     text_color=c["primary"]).pack(side="left")
+        selectors = ctk.CTkFrame(header, fg_color="transparent")
+        selectors.pack(side="right")
+        chart = {"window": "session", "colors": c, "buttons": {}}
+        for key, title in (("session", "5h"), ("weekly", "7g")):
+            button = ctk.CTkButton(
+                selectors, text=title, width=42, height=25,
+                fg_color=c["lite"] if key == "session" else "transparent",
+                hover_color=c["hover"], text_color=c["primary"],
+                corner_radius=7, command=lambda value=key: self._select_activity_window(name, value))
+            button.pack(side="left", padx=2)
+            chart["buttons"][key] = button
+        chart["note"] = ctk.CTkLabel(card, text="", font=("Segoe UI", 10),
+                                     text_color=c["second"], anchor="w",
+                                     wraplength=290, justify="left")
+        chart["note"].pack(fill="x", padx=14, pady=(0, 2))
+        chart["canvas"] = ctk.CTkCanvas(card, height=112, bg=c["card"], highlightthickness=0)
+        chart["canvas"].bind("<Configure>", lambda _event: self._draw_activity_chart(name))
+        chart["canvas"].bind("<Map>", lambda _event: self._draw_activity_chart(name))
+        chart["canvas"].pack(fill="x", padx=8, pady=(0, 2))
+        chart["projection"] = ctk.CTkLabel(card, text="", font=("Segoe UI", 10),
+                                           text_color=c["second"], anchor="w",
+                                           wraplength=290, justify="left")
+        chart["projection"].pack(fill="x", padx=14, pady=(0, 9))
+        self._charts[name] = chart
+        self._refresh_activity_chart(name)
+
+    def _select_activity_window(self, name, key):
+        chart = self._charts[name]
+        chart["window"] = key
+        for other, button in chart["buttons"].items():
+            button.configure(fg_color=chart["colors"]["lite"] if other == key else "transparent")
+        self._refresh_activity_chart(name)
+
+    def _draw_activity_chart(self, name):
+        chart = self._charts.get(name)
+        if chart is None:
+            return
+        c, canvas = chart["colors"], chart["canvas"]
+        canvas.delete("all")
+        width, height = max(canvas.winfo_width(), 280), 112
+        left, right, top, bottom = 30, width - 10, 10, height - 22
+        plot_h = bottom - top
+        for pct in (0, 50, 100):
+            y = bottom - plot_h * pct / 100
+            canvas.create_line(left, y, right, y, fill=c["divider"])
+            canvas.create_text(left - 5, y, text=str(pct), anchor="e",
+                               fill=c["second"], font=("Segoe UI", 9))
+        canvas.create_text(left, height - 2, text="inizio finestra", anchor="sw",
+                           fill=c["second"], font=("Segoe UI", 9))
+        canvas.create_text(right, height - 2, text="ora", anchor="se",
+                           fill=c["second"], font=("Segoe UI", 9))
+        samples = self._histories[name].get(chart["window"], [])
+        if not samples:
+            canvas.create_text((left + right) / 2, (top + bottom) / 2,
+                               text="In attesa di campioni quota live",
+                               fill=c["second"], font=("Segoe UI", 10))
+            return
+        latest = samples[-1]
+        start_at = latest["reset_at"] - latest["duration"]
+        samples = [sample for sample in samples
+                   if abs(sample["reset_at"] - latest["reset_at"]) <= 120
+                   and sample["at"] >= start_at]
+        points = []
+        for sample in samples:
+            x = left + (right - left) * min(1, max(0, (sample["at"] - start_at) / latest["duration"]))
+            y = bottom - plot_h * sample["used"] / 100
+            points.append((x, y, sample["at"]))
+        for a, b in zip(points, points[1:]):
+            if b[2] - a[2] <= 300:
+                canvas.create_line(a[0], a[1], b[0], b[1], fill=c["line"], width=2)
+        for x, y, _ in points:
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                               fill=c["line"], outline=c["line"])
+
+    def _refresh_activity_chart(self, name):
+        chart = self._charts.get(name)
+        if chart is None:
+            return
+        window = chart["window"]
+        samples = self._histories[name].get(window, [])
+        chart["note"].configure(text=_quota_change_text(samples, poll="~5 min" if name == "claude" else "~1 min"))
+        self._draw_activity_chart(name)
+        data = self._claude if name == "claude" else self._codex
+        prefix = "session" if window == "session" else "weekly"
+        text, color = _quota_forecast_display(
+            data.get(f"{prefix}_used_pct"), data.get(f"{prefix}_reset_at"),
+            data.get(f"{prefix}_observed_at"), data.get(f"{prefix}_window_seconds"),
+            chart["colors"]["second"])
+        chart["projection"].configure(text=text, text_color=color)
+
+    def update_codex_quota(self, data):
+        self._codex = data
+        for key, prefix in (("session", "session"), ("weekly", "weekly")):
+            used = data.get(f"{prefix}_used_pct")
+            if used is None or key not in self._quota_bar_refs:
+                continue
+            label, fill, reset_label = self._quota_bar_refs[key]
+            remaining = max(0, 100 - used)
+            color = self._oa_bar_color(used)
+            label.configure(text=f"{remaining}% left", text_color=color)
+            fill.configure(fg_color=color)
+            fill.place(relx=0, rely=0, relwidth=max(remaining / 100, 0.015), relheight=1)
+            if reset_label is not None and data.get(f"{prefix}_reset"):
+                reset_label.configure(text=f"Resets {data[f'{prefix}_reset']}")
+            forecast = self._forecast_labels.get(key)
+            if forecast is not None:
+                text, text_color = _quota_forecast_display(
+                    used, data.get(f"{prefix}_reset_at"), data.get(f"{prefix}_observed_at"),
+                    data.get(f"{prefix}_window_seconds"), self.OA_SECOND)
+                forecast.configure(text=text, text_color=text_color)
+        self._refresh_activity_chart("openai")
+
     # ═══════════════════════════════════════
 
     def _build_footer(self, parent):
@@ -1664,6 +1912,8 @@ class CodexBarApp:
         self.popup = None
         self.running = True
         self.codex_data = None
+        self.quota_history = {"session": [], "weekly": []}
+        self.claude_history = {"session": [], "weekly": []}
         # provider currently shown in the tray / last tab opened by the user
         self.active_provider = "claude"
 
@@ -1685,6 +1935,7 @@ class CodexBarApp:
     def start(self):
         print("[CodexBar] Fetching your real usage data...\n")
         self.fetcher.fetch_all()
+        _record_quota_sample(self.claude_history, self.fetcher.data)
         print(f"\n[CodexBar] Source: {self.fetcher.data['source']}")
         try:
             self.codex_data = self.codex_fetcher.fetch()
@@ -1693,6 +1944,7 @@ class CodexBarApp:
             print(f"[CodexBar] Codex fetch err: {e}")
             self.codex_data = CodexDataFetcher._empty()
 
+        _record_quota_sample(self.quota_history, self.codex_data)
         self.active_provider = self.default_provider(
             self.fetcher.data, self.codex_data, self.prefer_codex)
         print(f"[CodexBar] Default tab: {'Codex' if self.active_provider == 'openai' else 'Claude'}")
@@ -1721,6 +1973,7 @@ class CodexBarApp:
 
         # ── auto-refresh every 5 min ──
         self.root.after(300_000, self._auto_refresh)
+        self.root.after(60_000, self._auto_quota_refresh)
 
         print("\n" + "=" * 50)
         print("  CodexBar running in system tray!")
@@ -1769,6 +2022,8 @@ class CodexBarApp:
             on_quit=lambda: self.root.after(0, self._do_quit),
             on_tab_switch=self._on_tab_switch,
             initial_tab=self.active_provider,
+            quota_history=self.quota_history,
+            claude_quota_history=self.claude_history,
         )
 
     def _on_popup_closed(self):
@@ -1825,11 +2080,14 @@ class CodexBarApp:
             claude_before = dict(self.fetcher.data)  # fetch_all mutates the same dict
             codex_before = self.codex_data
             self.fetcher.fetch_all()
+            _record_quota_sample(self.claude_history, self.fetcher.data)
             try:
                 self.codex_data = self.codex_fetcher.fetch()
             except Exception:
                 pass
             d = self.fetcher.data
+            if self.codex_data and self.codex_data.get("source") == "api":
+                self.root.after(0, self._apply_codex_quota, dict(self.codex_data))
             # keep the icon of the provider the user is currently on
             # (a refresh used to silently flip it back to Claude)
             self.tray.icon = make_icon(
@@ -1847,6 +2105,42 @@ class CodexBarApp:
             return
         self._do_refresh()
         self.root.after(300_000, self._auto_refresh)
+    def _auto_quota_refresh(self):
+        if not self.running:
+            return
+
+        def bg():
+            try:
+                data = self.codex_fetcher.fetch_quota()
+            except Exception:
+                data = None
+            if data and self.running and self.root:
+                try:
+                    self.root.after(0, self._apply_codex_quota, data)
+                except Exception:
+                    pass
+
+        threading.Thread(target=bg, daemon=True).start()
+        self.root.after(60_000, self._auto_quota_refresh)
+
+    def _apply_codex_quota(self, data):
+        if not data or data.get("source") != "api":
+            return
+        _record_quota_sample(self.quota_history, data)
+        fields = ("session_used_pct", "session_reset", "session_reset_at",
+                  "session_observed_at", "session_window_seconds", "weekly_used_pct",
+                  "weekly_reset", "weekly_reset_at", "weekly_observed_at",
+                  "weekly_window_seconds", "source", "updated", "available", "plan")
+        if self.codex_data is None:
+            self.codex_data = CodexDataFetcher._empty()
+        self.codex_data.update({key: data[key] for key in fields if key in data})
+        if self.popup:
+            self.popup.update_codex_quota(self.codex_data)
+        try:
+            self.tray.title = self._tooltip_text()
+        except Exception:
+            pass
+
 
     # ── quit ──
 
@@ -1868,6 +2162,10 @@ class CodexBarApp:
 # ─────────────────────────────────────────────
 
 if __name__ == '__main__':
+    if '--check-forecast' in sys.argv:
+        _check_quota_forecast()
+        print('Quota forecast checks passed')
+        raise SystemExit(0)
     print(r"""
    ========================================
     CodexBar for Windows v1.2.0

@@ -14,53 +14,40 @@ Windows port of [steipete/CodexBar](https://github.com/steipete/CodexBar) for ma
 </p>
 
 ## Security note (please read)
+**The v1.2.0 executable is available from the [GitHub Releases page](https://github.com/paraflu/CodexBar-Win/releases/tag/v1.2.0).** This build does not access browser data: it uses Claude Code's local credentials, Codex's `~/.codex/auth.json`, and pi agent session logs. Earlier releases v1.0.0–v1.1.2 included browser-cookie access and have been withdrawn; do not use those old executables.
 
-**Releases v1.0.0 – v1.1.2 shipped a PyInstaller `CodexBar.exe` that antivirus engines
-flag as a trojan/infostealer. Those binaries have been removed and are no longer
-available.** The detection was triggered by two things:
+The v1.2.0 exe is an unsigned, single-file PyInstaller bundle. Antivirus software may flag it heuristically. If you prefer, build it yourself from source with `build.ps1`.
 
-1. A fallback that read the `sessionKey` cookie from Chrome/Edge/Brave (copying the
-   cookie database and decrypting it with DPAPI + AES-GCM) to call the Claude.ai usage
-   API. That is the exact technique used by real infostealers, and AV heuristics cannot
-   tell the difference — even though the cookie was only ever sent to `api.claude.ai`.
-2. An unsigned, single-file PyInstaller executable, which is a common false-positive source
-   on its own.
+## Download or build
 
-Nothing was ever exfiltrated, but shipping browser-cookie-decryption code was the wrong
-design. As of this commit the app **never touches your browser**: it only uses the
-Claude Code CLI and the credentials file Claude Code already stores locally.
-No prebuilt executables are distributed anymore — run it from source so you can read
-exactly what it does.
+- **Download:** [CodexBar.exe v1.2.0](https://github.com/paraflu/CodexBar-Win/releases/download/v1.2.0/CodexBar.exe). Run it directly; no installation required. Pass `--codex` if launching from a terminal to open on the Codex tab.
+- **Run from source:** install [uv](https://docs.astral.sh/uv/), then:
 
-If you downloaded an old `CodexBar.exe`, delete it. There is nothing else to clean up.
-
-## Install (run from source)
-
-```bash
-git clone https://github.com/babakarto/CodexBar-Win.git
+```powershell
+git clone https://github.com/paraflu/CodexBar-Win.git
 cd CodexBar-Win
-uv sync                       # creates .venv and installs the locked deps
-uv run codexbar.py            # Claude tab first
-uv run codexbar.py --codex    # Codex tab first (falls back to Claude if Codex isn't set up)
+uv sync
+uv run codexbar.py          # Claude tab first
+uv run codexbar.py --codex  # Codex tab first
 ```
 
-Or double-click `CodexBar.bat` — it syncs the environment and launches.
+Double-click `CodexBar.bat` to sync the environment and launch from source.
 
-## Build the .exe
+### Build the exe yourself
 
 ```powershell
 .\build.ps1
 ```
 
-Uses `uv` for the environment and PyInstaller (dev dependency) for the bundle, and
-leaves a single `dist\CodexBar.exe` with no console window. `build\`, `dist\` and the
-generated `CodexBar.spec` are ignored by git.
+This runs `uv sync --group dev` and PyInstaller, creating `dist\CodexBar.exe` (onefile, no console).
 
 ## Requirements
 
 - **Windows 10 or 11**
-- **Claude Code CLI** installed and logged in (`claude` in PATH)
-- **uv** ([install](https://docs.astral.sh/uv/)) — it provides Python 3.10+ for the venv
+- **uv** ([install](https://docs.astral.sh/uv/)) for running/building from source; the released exe needs no Python or uv
+- **Codex CLI logged in** for live Codex quota; optional for running the Claude tab
+- **Claude Code CLI** logged in for live Claude quota
+- **pi agent** session logs provide measured Codex-tab costs (Windows logs; WSL sessions aren't included)
 
 ## Features
 
@@ -74,17 +61,19 @@ generated `CodexBar.spec` are ignored by git.
 - **Provider branding** — Claude orange palette + OpenAI dark/green theme, tray icon switches per tab
 - **Smart default tab** — opens on Codex (with the OpenAI tray icon) when Claude Code is not installed
 - **Auto-refresh** — updates every 5 minutes
-- **Zero config** — reads everything Claude Code already stores locally
+- **No extra API keys** — uses the credentials already stored by Claude Code, Codex CLI and pi agent
+- **Startup option** — toggle “Start with Windows” from the tray menu (per-user, no admin required)
+- **Diagnostic log** — the windowed exe writes to `%USERPROFILE%\.codexbar\codexbar.log`
 
 ## How It Gets Data
 
-CodexBar tries multiple methods in order, using the first that succeeds:
+For **Claude Code**, CodexBar tries these sources in order for quota; JSONL logs also provide cost data:
 
 | Priority | Method | What it does |
 |----------|--------|-------------|
 | 1 | **CLI (PTY)** | Spawns interactive `claude` via pseudo-terminal, sends `/usage`, parses output |
 | 2 | **OAuth token** | Reads `~/.claude/.credentials.json`, calls Claude.ai API |
-| 3 | **JSONL logs** | Scans `~/.claude/projects/` for conversation logs (always runs for cost data) |
+| 3 | **JSONL logs** | Scans `~/.claude/projects/` for conversation usage and cost |
 
 For **Codex** the quota comes from the same endpoint the ChatGPT dashboard uses
 (`chatgpt.com/backend-api/wham/usage`, token from `~/.codex/auth.json`), because the
@@ -106,10 +95,10 @@ logs.
 | **Language** | Swift | Python |
 | **Providers** | 16+ (Claude, Cursor, Copilot, Gemini...) | Claude Code + OpenAI Codex |
 | **Data source** | CLI PTY | CLI PTY → OAuth → JSONL |
-| **Install** | `brew install --cask steipete/tap/codexbar` | Run from source (`pip install -r requirements.txt`) |
-| **Auto-update** | Sparkle framework | `git pull` |
+| **Install** | `brew install --cask steipete/tap/codexbar` | Download `CodexBar.exe` from [v1.2.0](https://github.com/paraflu/CodexBar-Win/releases/tag/v1.2.0), or build with uv |
+| **Auto-update** | Sparkle framework | Manual download / rebuild |
 | **Browser access** | Keychain cookie read | None |
-| **Size** | ~5 MB (native) | ~80 KB of Python (plus deps) |
+| **Distribution** | ~5 MB (native) | Unsigned PyInstaller onefile exe; AV may flag heuristically |
 | **License** | MIT | MIT |
 
 ## Troubleshooting
@@ -117,9 +106,11 @@ logs.
 | Problem | Fix |
 |---------|-----|
 | No usage data shown | Make sure `claude` is in PATH and you're logged in |
-| "winpty not found" | `pip install pywinpty` |
+| “winpty not found” | Run `uv sync`; confirm the app is launched with `uv run codexbar.py` |
+| Codex quota unavailable | Sign in to Codex CLI so `~/.codex/auth.json` exists; refresh falls back to the last readable local rollout |
+| Codex “Today” cost is `—` or $0.00 | pi must have recorded assistant usage today in `~/.pi/agent/sessions`; Windows logs only (WSL sessions are not included) |
 | Popup doesn't appear | Check the system tray overflow area (click ^ arrow near clock) |
-| CLI shows 0% | Another Claude Code session may be running — CodexBar spawns its own PTY |
+| Startup option doesn't stick | It writes a per-user Windows Run entry; no admin required, but the executable must stay at the same path |
 
 ## Credits
 
