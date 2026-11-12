@@ -6,7 +6,7 @@ Native customtkinter popup. Uses only the local Claude Code CLI and its
 credentials file — it never touches your browser.
 
 Requirements: uv sync
-Usage: uv run codexbar.py [--codex]     (build.ps1 produces dist/CodexBar.exe)
+Usage: uv run codexbar.py [--codex] [--no-window-alerts]     (build.ps1 produces dist/CodexBar.exe)
 """
 
 import os
@@ -96,6 +96,23 @@ def _quota_forecast_display(used, reset_at, observed_at, duration, text_color, n
 
 
 
+def _reset_warning_due(used_pct, reset_at, now):
+    """True in the last minute before a window resets, when it is above 90% used."""
+    return reset_at is not None and used_pct > 90 and 0 < reset_at - now <= 60
+
+
+def _window_event(reset_at, now, lead=900, grace=300):
+    """'ending' in the last `lead` s before a 5h reset, 'started' within `grace` s after it."""
+    if reset_at is None:
+        return None
+    left = reset_at - now
+    if 0 < left <= lead:
+        return "ending"
+    if -grace < left <= 0:
+        return "started"
+    return None
+
+
 def _record_quota_sample(history, data, now=None):
     now = time.time() if now is None else now
     if data.get("source") != "api":
@@ -143,6 +160,14 @@ def _check_quota_forecast():
     now = 1_700_000_000
     assert math.isclose(_quota_forecast(20, now + 4 * 3600, now, 5 * 3600, now)[0], 100)
     assert math.isclose(_quota_forecast(10, now + 2 * 86400, now, 7 * 86400, now)[0], 14)
+    assert _reset_warning_due(91, now + 30, now)
+    assert not _reset_warning_due(90, now + 30, now)
+    assert not _reset_warning_due(95, now + 120, now)
+    assert not _reset_warning_due(95, now - 1, now)
+    assert not _reset_warning_due(95, None, now)
+    assert _window_event(now + 900, now) == "ending" and _window_event(now + 901, now) is None
+    assert _window_event(now, now) == "started" and _window_event(now - 299, now) == "started"
+    assert _window_event(now - 301, now) is None and _window_event(None, now) is None
     assert _quota_forecast(0, now + 4 * 3600, now, 5 * 3600, now)[0] == 0
     assert math.isclose(_quota_forecast(90, now + 4 * 3600, now, 5 * 3600, now)[0], 450)
     assert math.isclose(_quota_forecast(30, now + 1800, now, 3600, now)[0], 60)
@@ -272,7 +297,7 @@ def _startup_command():
         if not exe.exists():
             exe = Path(sys.executable)
     script = "" if getattr(sys, 'frozen', False) else f' "{Path(__file__).resolve()}"'
-    flag = " --codex" if '--codex' in sys.argv else ""
+    flag = "".join(f" {f}" for f in ("--codex", "--no-window-alerts") if f in sys.argv)
     return f'"{exe}"{script}{flag}'
 
 
@@ -1903,7 +1928,7 @@ class CodexBarPopup(ctk.CTkToplevel):
 # ─────────────────────────────────────────────
 
 class CodexBarApp:
-    def __init__(self, prefer_codex=False):
+    def __init__(self, prefer_codex=False, window_alerts=True):
         self.prefer_codex = prefer_codex
         self.fetcher = ClaudeDataFetcher()
         self.codex_fetcher = CodexDataFetcher()
@@ -1914,6 +1939,10 @@ class CodexBarApp:
         self.codex_data = None
         self.quota_history = {"session": [], "weekly": []}
         self.claude_history = {"session": [], "weekly": []}
+        self._reset_warned = {}  # (provider, window) -> reset_at already notified
+        self.window_alerts = window_alerts
+        self._session_reset_seen = {}  # provider -> last 5h reset_at still in the future
+        self._window_warned = {}  # (provider, event) -> reset_at already notified
         # provider currently shown in the tray / last tab opened by the user
         self.active_provider = "claude"
 
@@ -1974,6 +2003,7 @@ class CodexBarApp:
         # ── auto-refresh every 5 min ──
         self.root.after(300_000, self._auto_refresh)
         self.root.after(60_000, self._auto_quota_refresh)
+        self.root.after(15_000, self._check_reset_warnings)
 
         print("\n" + "=" * 50)
         print("  CodexBar running in system tray!")
@@ -2075,6 +2105,51 @@ class CodexBarApp:
                 except Exception:
                     pass
 
+    def _check_reset_warnings(self):
+        if not self.running:
+            return
+        try:
+            now = time.time()
+            msgs = []
+            for provider, d in (("Claude", self.fetcher.data), ("Codex", self.codex_data or {})):
+                for label, pct, reset_key in (("5h", "session_used_pct", "session_reset_at"),
+                                              ("weekly", "weekly_used_pct", "weekly_reset_at")):
+                    used = d.get(pct) or 0
+                    reset_at = d.get(reset_key)
+                    if not _reset_warning_due(used, reset_at, now):
+                        continue
+                    key = (provider, label)
+                    # shortcut: Claude usage is cached up to 5 min, so a crossing in that gap can be missed; refresh at T-1min to upgrade
+                    if key in self._reset_warned and abs(self._reset_warned[key] - reset_at) < 120:
+                        continue
+                    self._reset_warned[key] = reset_at
+                    print(f"[CodexBar] Reset soon: {provider} {label} at {used}% used")
+                    msgs.append(f"{provider} {label}: {used}% used, resets in 1 min")
+            if self.window_alerts:
+                for provider, d in (("Claude", self.fetcher.data), ("Codex", self.codex_data or {})):
+                    cur = d.get("session_reset_at")
+                    used = d.get("session_used_pct") or 0
+                    # stored value survives a quota refresh that already moved reset_at to the next window
+                    for reset_at in {cur, self._session_reset_seen.get(provider)} - {None}:
+                        event = _window_event(reset_at, now)
+                        key = (provider, event)
+                        if event is None or abs(self._window_warned.get(key, 0) - reset_at) < 120:
+                            continue
+                        self._window_warned[key] = reset_at
+                        if event == "ending":
+                            msgs.append(f"{provider} 5h window ends in {math.ceil((reset_at - now) / 60)} min ({100 - used}% left)")
+                        else:
+                            msgs.append(f"{provider} 5h window reset: quota available again")
+                    # saved only after the candidates above, so the previous window's start is not lost
+                    if cur and cur > now:
+                        self._session_reset_seen[provider] = cur
+            if msgs:
+                self.tray.notify("\n".join(msgs), "CodexBar")
+        except Exception as e:
+            print(f"[CodexBar] Reset check err: {e}")
+        finally:
+            self.root.after(15_000, self._check_reset_warnings)
+
     def _do_refresh(self):
         def bg():
             claude_before = dict(self.fetcher.data)  # fetch_all mutates the same dict
@@ -2159,6 +2234,26 @@ class CodexBarApp:
         sys.exit(0)
 
 
+# Named mutex: a second copy finds it already created and exits.
+_SINGLE_INSTANCE = "Local\\CodexBarWinSingleInstance"
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance(name=_SINGLE_INSTANCE):
+    """True when no other CodexBar holds the mutex; the handle lives until exit."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW(None, False, name)
+    return ctypes.get_last_error() != _ERROR_ALREADY_EXISTS
+
+
+def _check_single_instance():
+    name = f"Local\\CodexBarWinTest{os.getpid()}"
+    assert _acquire_single_instance(name)
+    assert not _acquire_single_instance(name)
+
+
 # ─────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -2166,10 +2261,19 @@ if __name__ == '__main__':
         _check_quota_forecast()
         print('Quota forecast checks passed')
         raise SystemExit(0)
+    if '--check-single-instance' in sys.argv:
+        _check_single_instance()
+        print('Single-instance check passed')
+        raise SystemExit(0)
+    if not _acquire_single_instance():
+        # windowed exe has no console: the dialog is the only feedback
+        print('[CodexBar] Already running.')
+        ctypes.windll.user32.MessageBoxW(None, "CodexBar è già in esecuzione (icona vicino all'orologio).", "CodexBar", 0x40)
+        raise SystemExit(0)
     print(r"""
    ========================================
     CodexBar for Windows v1.2.0
     Native popup — no browser needed
    ========================================
     """)
-    CodexBarApp(prefer_codex='--codex' in sys.argv).start()
+    CodexBarApp(prefer_codex='--codex' in sys.argv, window_alerts='--no-window-alerts' not in sys.argv).start()

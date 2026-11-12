@@ -29,6 +29,7 @@ cd CodexBar-Win
 uv sync
 uv run codexbar.py          # Claude tab first
 uv run codexbar.py --codex  # Codex tab first
+uv run codexbar.py --no-window-alerts  # no 5h window alerts
 ```
 
 Double-click `CodexBar.bat` to sync the environment and launch from source.
@@ -56,6 +57,7 @@ This runs `uv sync --group dev` and PyInstaller, creating `dist\CodexBar.exe` (o
 - **Tray tooltip** — hovering the tray icon shows what is left on the 5h and weekly window
 - **Reset countdowns** — know exactly when your limits refresh
 - **Threshold alerts** — tray notification when a 5h or weekly window crosses 80% or 95% used (once per crossing; a reset re-arms it)
+- **5h window alerts** — tray notification 15 min before a 5h window ends and when the next one starts, for Claude and Codex (on by default; `--no-window-alerts` turns them off). Claude needs reset times from the OAuth source, so these alerts don't fire when the CLI source supplies the data
 - **Cost tracking** — Claude from `~/.claude` logs, Codex tab from pi agent's own priced logs (`~/.pi/agent/sessions`): real tokens, not an estimate
 - **Native popup** — customtkinter window with rounded corners, slide-up animation
 - **Provider branding** — Claude orange palette + OpenAI dark/green theme, tray icon switches per tab
