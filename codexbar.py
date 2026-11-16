@@ -367,24 +367,25 @@ class ClaudeDataFetcher:
         print("[CodexBar] Fetching real usage data...")
         got_usage = False
 
-        # 1) Try CLI
-        cli = self._fetch_cli()
-        if cli and cli.get("source") == "cli":
-            self.data = cli
+        # 1) OAuth token from ~/.claude/.credentials.json: plain HTTP, no PTY,
+        #    so no ConPTY conhost is left behind on each refresh
+        api = self._fetch_oauth_api()
+        if api and api.get("source") == "api":
+            self.data = api
             got_usage = True
-            print(f"  OK CLI: session {cli['session_used_pct']}%, weekly {cli['weekly_used_pct']}%")
+            print(f"  OK OAuth: session {api['session_used_pct']}%, weekly {api['weekly_used_pct']}%")
         else:
-            print("  -- CLI: not available")
+            print("  -- OAuth: not available")
 
-        # 2) Try OAuth token from ~/.claude/.credentials.json
+        # 2) Fallback: interactive claude via PTY (leaks a conhost per call, see _pty_usage)
         if not got_usage:
-            api = self._fetch_oauth_api()
-            if api and api.get("source") == "api":
-                self.data = api
+            cli = self._fetch_cli()
+            if cli and cli.get("source") == "cli":
+                self.data = cli
                 got_usage = True
-                print(f"  OK OAuth: session {api['session_used_pct']}%, weekly {api['weekly_used_pct']}%")
+                print(f"  OK CLI: session {cli['session_used_pct']}%, weekly {cli['weekly_used_pct']}%")
             else:
-                print("  -- OAuth: not available")
+                print("  -- CLI: not available")
 
         # 3) Always try JSONL for cost data
         cost = self._fetch_jsonl()
