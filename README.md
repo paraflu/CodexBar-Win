@@ -59,6 +59,7 @@ This runs `uv sync --group dev` and PyInstaller, creating `dist\CodexBar.exe` (o
 - **Threshold alerts** — tray notification when a 5h or weekly window crosses 80% or 95% used (once per crossing; a reset re-arms it)
 - **5h window alerts** — tray notification 15 min before a 5h window ends and when the next one starts, for Claude and Codex (on by default; `--no-window-alerts` turns them off). Claude needs reset times from the OAuth source, so these alerts don't fire when the CLI source supplies the data
 - **Cost tracking** — Claude from `~/.claude` logs, Codex tab from pi agent's own priced logs (`~/.pi/agent/sessions`): real tokens, not an estimate
+- **Usage report (Excel)** — every quota sample (5h and weekly, Claude and Codex) is stored in `~/.codexbar/usage.db` (history starts from the first run, no backfill). Tray → *Esporta report Excel* writes the current month to `~/.codexbar/reports/` and opens it: daily weekly consumption, weekly % at end of day, and the 5h windows with their peak. Other months: `uv run codexbar.py --export-report 2026-10`. Needs `openpyxl` (installed by `uv sync`)
 - **Native popup** — customtkinter window with rounded corners, slide-up animation
 - **Provider branding** — Claude orange palette + OpenAI dark/green theme, tray icon switches per tab
 - **Smart default tab** — opens on Codex (with the OpenAI tray icon) when Claude Code is not installed

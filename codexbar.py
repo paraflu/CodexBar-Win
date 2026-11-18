@@ -20,6 +20,8 @@ import shutil
 import threading
 import ctypes
 import base64
+import sqlite3
+from contextlib import closing
 import webbrowser
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -154,6 +156,176 @@ def _quota_change_text(samples, now=None, poll="~1 min"):
     age = "ora" if age_minutes <= 1 else f"{age_minutes} min fa"
     delta = latest["used"] - previous["used"]
     return f"Variazione account: {delta:+.0f} punti in {minutes} min · ultimo campione {age} · dati da avvio · poll {poll}"
+
+
+# ── usage report: samples go to SQLite, the Excel file is built on demand ──
+QUOTA_DB = Path.home() / ".codexbar" / "usage.db"
+REPORTS_DIR = Path.home() / ".codexbar" / "reports"
+_SAMPLE_COLUMNS = ("provider", "win", "at", "used", "reset_at", "duration")
+
+
+def _open_quota_db(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE IF NOT EXISTS samples (provider TEXT, win TEXT, at REAL, used REAL, "
+               "reset_at REAL, duration REAL, PRIMARY KEY (provider, win, at))")
+    return db
+
+
+def _save_quota(provider, history, path=QUOTA_DB):
+    """Store the newest accepted sample of each window; the primary key makes repeats no-ops."""
+    try:
+        with closing(_open_quota_db(path)) as db, db:
+            for win in ("session", "weekly"):
+                if history[win]:
+                    s = history[win][-1]
+                    db.execute("INSERT OR IGNORE INTO samples VALUES (?, ?, ?, ?, ?, ?)",
+                               (provider, win, s["at"], s["used"], s["reset_at"], s["duration"]))
+    except (OSError, sqlite3.Error) as e:
+        print(f"[CodexBar] Usage DB err: {e}")
+
+
+def _quota_windows(rows):
+    """Group rows sorted by (provider, win, at) into windows: same reset_at within 120 s and same length."""
+    windows = []
+    for row in rows:
+        last = windows[-1][-1] if windows else None
+        if (last and last["provider"] == row["provider"] and last["win"] == row["win"]
+                and abs(last["reset_at"] - row["reset_at"]) <= 120 and last["duration"] == row["duration"]):
+            windows[-1].append(row)
+        else:
+            windows.append([row])
+    return windows
+
+
+def _usage_report_rows(rows, start, end):
+    """Daily weekly gain and 5h peaks for samples in [start, end); rows may begin earlier as a baseline."""
+    days = {}
+    windows = []
+
+    def day(provider, at):
+        return days.setdefault((provider, datetime.fromtimestamp(at).date()),
+                               {"week_gain": None, "week_end": None, "peaks": []})
+
+    for window in _quota_windows(rows):
+        head = window[0]
+        if head["win"] == "weekly":
+            prev = 0.0 if head["at"] - (head["reset_at"] - head["duration"]) <= 3600 else head["used"]
+            for row in window:
+                if start <= row["at"] < end:
+                    d = day(head["provider"], row["at"])
+                    d["week_gain"] = (d["week_gain"] or 0.0) + max(0.0, row["used"] - prev)
+                    d["week_end"] = row["used"]
+                prev = row["used"]
+        else:
+            begin = head["reset_at"] - head["duration"]
+            if start <= begin < end:
+                peak = max(row["used"] for row in window)
+                day(head["provider"], begin)["peaks"].append(peak)
+                windows.append({"provider": head["provider"], "start": datetime.fromtimestamp(begin),
+                                "end": datetime.fromtimestamp(head["reset_at"]), "peak": peak})
+
+    daily = []
+    for (provider, date), d in sorted(days.items()):
+        peaks = d["peaks"]
+        daily.append({"provider": provider, "day": date, "week_gain": d["week_gain"],
+                      "week_end": d["week_end"], "n5h": len(peaks),
+                      "peak_avg": round(sum(peaks) / len(peaks), 1) if peaks else None,
+                      "peak_max": max(peaks, default=None)})
+    return daily, windows
+
+
+def export_usage_report(year, month, path=QUOTA_DB, out_dir=REPORTS_DIR):
+    """Write one month of 5h and weekly usage to an .xlsx file and return its path."""
+    from openpyxl import Workbook  # lazy: only the export needs it
+    start = datetime(year, month, 1).timestamp()
+    end = datetime(year + month // 12, month % 12 + 1, 1).timestamp()
+    with closing(_open_quota_db(path)) as db:
+        rows = [dict(zip(_SAMPLE_COLUMNS, r)) for r in db.execute(
+            f"SELECT {', '.join(_SAMPLE_COLUMNS)} FROM samples WHERE at >= ? AND at < ? ORDER BY provider, win, at",
+            (start - 7 * 86400, end + 6 * 3600))]  # 7 days back: weekly baseline; 6 h forward: a 5h window's last samples
+    daily, windows = _usage_report_rows(rows, start, end)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Giornaliero"
+    ws.append(["Provider", "Giorno", "Settimana: consumo del giorno (%)", "Settimana: fine giornata (%)",
+               "Ritmo teorico settimana (%)", "5h: finestre iniziate", "5h: picco medio (%)", "5h: picco massimo (%)"])
+    for d in daily:
+        ws.append([d["provider"], d["day"], d["week_gain"], d["week_end"], round(100 / 7, 1),
+                   d["n5h"], d["peak_avg"], d["peak_max"]])
+    ws5 = wb.create_sheet("Finestre 5h")
+    ws5.append(["Provider", "Inizio", "Fine", "Picco (%)"])
+    for w in windows:
+        ws5.append([w["provider"], w["start"], w["end"], w["peak"]])
+    for sheet in (ws, ws5):
+        sheet.freeze_panes = "A2"
+        for col in sheet.columns:
+            sheet.column_dimensions[col[0].column_letter].width = 26
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"codexbar-{year}-{month:02d}.xlsx"
+    wb.save(out)
+    return out
+
+
+def _check_usage_report():
+    import tempfile
+    from openpyxl import load_workbook
+    day0 = datetime(2026, 11, 16).timestamp()
+
+    def hour(h):
+        return day0 + h * 3600
+
+    def sample(provider, win, at_h, used, reset_h, duration):
+        return dict(zip(_SAMPLE_COLUMNS, (provider, win, hour(at_h), used, hour(reset_h), duration)))
+
+    week, five_h = 7 * 86400, 5 * 3600
+    rows = [
+        # weekly W1 starts at 9.5 h, so its first sample is near the start: day 1 = 10 + 6 = 16, day 2 = 2 + 12
+        sample("codex", "weekly", 10, 10, 177.5, week),
+        sample("codex", "weekly", 23, 16, 177.5, week),
+        sample("codex", "weekly", 25, 18, 177.5, week),
+        sample("codex", "weekly", 36, 30, 177.5, week),
+        sample("codex", "weekly", 42, 3, 210, week),
+        # 5h windows by start day: three on day 1 (peaks 60, 45, 80), one on day 2 (peak 12)
+        sample("codex", "session", 1, 0, 6, five_h),
+        sample("codex", "session", 4, 35, 6, five_h),
+        sample("codex", "session", 5.5, 60, 6, five_h),
+        sample("codex", "session", 9, 20, 13, five_h),
+        sample("codex", "session", 12, 45, 13, five_h),
+        sample("codex", "session", 23.5, 5, 28, five_h),
+        sample("codex", "session", 27, 80, 28, five_h),
+        sample("codex", "session", 36, 12, 40, five_h),
+    ]
+    daily, windows = _usage_report_rows(rows, day0, hour(48))
+    by_day = {(d["provider"], d["day"].day): d for d in daily}
+    day1, day2 = by_day[("codex", 16)], by_day[("codex", 17)]
+    assert day1["week_gain"] == 16 and day1["week_end"] == 16
+    assert day2["week_gain"] == 17 and day2["week_end"] == 3
+    assert day1["n5h"] == 3 and day1["peak_max"] == 80 and day1["peak_avg"] == 61.7
+    assert day2["n5h"] == 1 and day2["peak_max"] == 12
+    assert len(windows) == 4
+    # a weekly window first seen at 40% a day after its start: those 40 points are not day gain
+    late_days, _ = _usage_report_rows([sample("claude", "weekly", 96, 40, 192, week),
+                                       sample("claude", "weekly", 100, 45, 192, week)], day0, hour(120))
+    assert late_days[0]["week_gain"] == 5
+
+    with tempfile.TemporaryDirectory() as directory:
+        db = Path(directory) / "usage.db"
+        history = {"session": [{"at": hour(1), "used": 0, "reset_at": hour(6), "duration": five_h}], "weekly": []}
+        _save_quota("codex", history, db)
+        _save_quota("codex", history, db)  # same sample twice
+        with closing(sqlite3.connect(db)) as con:
+            assert con.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+            con.execute("DELETE FROM samples")
+            con.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?)",
+                            [tuple(r[c] for c in _SAMPLE_COLUMNS) for r in rows])
+            con.commit()
+        out = export_usage_report(2026, 11, db, Path(directory))
+        book = load_workbook(out)
+        assert book.sheetnames == ["Giornaliero", "Finestre 5h"]
+        assert book["Giornaliero"].max_row == 3 and book["Finestre 5h"].max_row == 5
 
 
 def _check_quota_forecast():
@@ -1966,6 +2138,7 @@ class CodexBarApp:
         print("[CodexBar] Fetching your real usage data...\n")
         self.fetcher.fetch_all()
         _record_quota_sample(self.claude_history, self.fetcher.data)
+        _save_quota("claude", self.claude_history)
         print(f"\n[CodexBar] Source: {self.fetcher.data['source']}")
         try:
             self.codex_data = self.codex_fetcher.fetch()
@@ -1975,6 +2148,7 @@ class CodexBarApp:
             self.codex_data = CodexDataFetcher._empty()
 
         _record_quota_sample(self.quota_history, self.codex_data)
+        _save_quota("codex", self.quota_history)
         self.active_provider = self.default_provider(
             self.fetcher.data, self.codex_data, self.prefer_codex)
         print(f"[CodexBar] Default tab: {'Codex' if self.active_provider == 'openai' else 'Claude'}")
@@ -1992,6 +2166,7 @@ class CodexBarApp:
         menu = Menu(
             MenuItem('Open CodexBar', self._tray_open, default=True),
             MenuItem('Refresh', self._tray_refresh),
+            MenuItem('Esporta report Excel', self._tray_export_report),
             MenuItem('Start with Windows', self._toggle_startup,
                      checked=lambda _item: startup_enabled()),
             Menu.SEPARATOR,
@@ -2023,6 +2198,18 @@ class CodexBarApp:
 
     def _tray_refresh(self, *_):
         self.root.after(0, self._do_refresh)
+
+    def _tray_export_report(self, *_):
+        threading.Thread(target=self._export_report, daemon=True).start()
+
+    def _export_report(self):
+        now = datetime.now()
+        try:
+            path = export_usage_report(now.year, now.month)
+            os.startfile(path)
+        except Exception as e:
+            print(f"[CodexBar] Export err: {e}")
+            self.tray.notify(f"Export fallito: {e}", "CodexBar")
 
     def _toggle_startup(self, *_):
         set_startup(not startup_enabled())
@@ -2157,6 +2344,7 @@ class CodexBarApp:
             codex_before = self.codex_data
             self.fetcher.fetch_all()
             _record_quota_sample(self.claude_history, self.fetcher.data)
+            _save_quota("claude", self.claude_history)
             try:
                 self.codex_data = self.codex_fetcher.fetch()
             except Exception:
@@ -2203,6 +2391,7 @@ class CodexBarApp:
         if not data or data.get("source") != "api":
             return
         _record_quota_sample(self.quota_history, data)
+        _save_quota("codex", self.quota_history)
         fields = ("session_used_pct", "session_reset", "session_reset_at",
                   "session_observed_at", "session_window_seconds", "weekly_used_pct",
                   "weekly_reset", "weekly_reset_at", "weekly_observed_at",
@@ -2261,6 +2450,15 @@ if __name__ == '__main__':
     if '--check-forecast' in sys.argv:
         _check_quota_forecast()
         print('Quota forecast checks passed')
+        raise SystemExit(0)
+    if '--check-report' in sys.argv:
+        _check_usage_report()
+        print('Usage report checks passed')
+        raise SystemExit(0)
+    if '--export-report' in sys.argv:
+        i = sys.argv.index('--export-report')
+        month = sys.argv[i + 1] if len(sys.argv) > i + 1 else datetime.now().strftime('%Y-%m')
+        print(export_usage_report(*map(int, month.split('-'))))
         raise SystemExit(0)
     if '--check-single-instance' in sys.argv:
         _check_single_instance()

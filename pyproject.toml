@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "customtkinter>=5.2",
+    "openpyxl>=3.1.5",
     "pillow>=10.0",
     "pystray>=0.19.5",
     "pywinpty>=2.0",
