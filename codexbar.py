@@ -155,7 +155,7 @@ def _quota_change_text(samples, now=None, poll="~1 min"):
     age_minutes = max(0, round((now - latest["at"]) / 60))
     age = "ora" if age_minutes <= 1 else f"{age_minutes} min fa"
     delta = latest["used"] - previous["used"]
-    return f"Variazione account: {delta:+.0f} punti in {minutes} min · ultimo campione {age} · dati da avvio · poll {poll}"
+    return f"Variazione account: {delta:+.0f} punti in {minutes} min · ultimo campione {age} · dati salvati · poll {poll}"
 
 
 # ── usage report: samples go to SQLite, the Excel file is built on demand ──
@@ -185,6 +185,24 @@ def _save_quota(provider, history, path=QUOTA_DB):
         print(f"[CodexBar] Usage DB err: {e}")
 
 
+def _load_quota(provider, path=QUOTA_DB):
+    """Latest stored samples of each window, in the shape of the in-memory history."""
+    history = {"session": [], "weekly": []}
+    if not path.exists():
+        return history
+    try:
+        with closing(_open_quota_db(path)) as db:
+            for win in history:
+                rows = db.execute("SELECT at, used, reset_at, duration FROM samples WHERE provider = ? AND win = ? "
+                                  "ORDER BY at DESC LIMIT 10080", (provider, win)).fetchall()
+                history[win] = [{"at": at, "used": used, "reset_at": reset_at, "duration": duration}
+                                for at, used, reset_at, duration in reversed(rows)]
+    except (OSError, sqlite3.Error) as e:
+        print(f"[CodexBar] Usage DB load err: {e}")
+        return {"session": [], "weekly": []}
+    return history
+
+
 def _quota_windows(rows):
     """Group rows sorted by (provider, win, at) into windows: same reset_at within 120 s and same length."""
     windows = []
@@ -198,6 +216,14 @@ def _quota_windows(rows):
     return windows
 
 
+def _window_kind(duration):
+    """'5h' or 'week' for the windows the report covers; None for other lengths (e.g. Codex's 30-day window)."""
+    for kind, seconds in (("5h", 5 * 3600), ("week", 7 * 86400)):
+        if abs(duration - seconds) <= 60:
+            return kind
+    return None
+
+
 def _usage_report_rows(rows, start, end):
     """Daily weekly gain and 5h peaks for samples in [start, end); rows may begin earlier as a baseline."""
     days = {}
@@ -207,23 +233,25 @@ def _usage_report_rows(rows, start, end):
         return days.setdefault((provider, datetime.fromtimestamp(at).date()),
                                {"week_gain": None, "week_end": None, "peaks": []})
 
-    for window in _quota_windows(rows):
+    ordered = sorted(rows, key=lambda r: (r["provider"], r["win"], r["duration"], r["at"]))
+    for window in _quota_windows(ordered):
         head = window[0]
-        if head["win"] == "weekly":
-            prev = 0.0 if head["at"] - (head["reset_at"] - head["duration"]) <= 3600 else head["used"]
+        kind = _window_kind(head["duration"])
+        begin = head["reset_at"] - head["duration"]
+        if kind == "week":
+            # shortcut: usage before the first sample is unknown when the app was off at window start; dropped, not guessed
+            prev = 0.0 if head["at"] - begin <= 3600 else head["used"]
             for row in window:
                 if start <= row["at"] < end:
                     d = day(head["provider"], row["at"])
                     d["week_gain"] = (d["week_gain"] or 0.0) + max(0.0, row["used"] - prev)
                     d["week_end"] = row["used"]
                 prev = row["used"]
-        else:
-            begin = head["reset_at"] - head["duration"]
-            if start <= begin < end:
-                peak = max(row["used"] for row in window)
-                day(head["provider"], begin)["peaks"].append(peak)
-                windows.append({"provider": head["provider"], "start": datetime.fromtimestamp(begin),
-                                "end": datetime.fromtimestamp(head["reset_at"]), "peak": peak})
+        elif kind == "5h" and start <= begin < end:
+            peak = max(row["used"] for row in window)
+            day(head["provider"], begin)["peaks"].append(peak)
+            windows.append({"provider": head["provider"], "start": datetime.fromtimestamp(round(begin)),
+                            "end": datetime.fromtimestamp(round(head["reset_at"])), "peak": peak})
 
     daily = []
     for (provider, date), d in sorted(days.items()):
@@ -232,12 +260,134 @@ def _usage_report_rows(rows, start, end):
                       "week_end": d["week_end"], "n5h": len(peaks),
                       "peak_avg": round(sum(peaks) / len(peaks), 1) if peaks else None,
                       "peak_max": max(peaks, default=None)})
+    windows.sort(key=lambda w: (w["provider"], w["start"]))
     return daily, windows
+
+
+EXCEL_BLUE = "1F4E78"
+_REPORT_NOTES = [
+    "Come leggere il report",
+    "",
+    "Giornaliero: una riga per provider e giorno.",
+    "Consumo del giorno: punti percentuali della quota settimanale consumati quel giorno, cioè la somma degli incrementi tra campioni consecutivi della stessa finestra. Un reset riparte da 0%.",
+    "Fine giornata: percentuale della quota settimanale usata all'ultimo campione del giorno.",
+    "5h: ogni finestra di 5 ore conta nel giorno in cui inizia; il picco è il massimo di quota usata durante la finestra.",
+    "Finestre di altra durata (es. 30 giorni su Codex) non entrano nel report. Una colonna vuota vuol dire che il provider non ha inviato quel dato.",
+    "Il consumo avvenuto prima del primo campione di una finestra (app spenta all'inizio) non viene contato.",
+    "Dati: ~/.codexbar/usage.db, raccolti dalla versione che salva il database; non esiste storico precedente.",
+]
+
+
+def _provider_spans(items):
+    """{provider: (first, last)} sheet rows of items sorted by provider; the table starts at row 2."""
+    spans = {}
+    for i, item in enumerate(items, start=2):
+        spans[item["provider"]] = (spans.get(item["provider"], (i, i))[0], i)
+    return spans
+
+
+def _style_table(ws, formats, widths, scale_cols):
+    """Header band, borders, zebra rows, number formats, colour scale on the % columns, filter, frozen header."""
+    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    thin = Side(style="thin", color="BFBFBF")
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=EXCEL_BLUE)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 34
+    for row in ws.iter_rows(min_row=2):
+        zebra = PatternFill("solid", fgColor="F2F6FA") if row[0].row % 2 == 0 else None
+        for cell in row:
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            cell.alignment = Alignment(horizontal="center")
+            if zebra:
+                cell.fill = zebra
+            if cell.column_letter in formats:
+                cell.number_format = formats[cell.column_letter]
+    for letter, width in zip("ABCDEFGHIJ", widths):
+        ws.column_dimensions[letter].width = width
+    for letter in (scale_cols if ws.max_row > 1 else ""):  # an empty month has no range to colour
+        ws.conditional_formatting.add(f"{letter}2:{letter}{ws.max_row}", ColorScaleRule(
+            start_type="num", start_value=0, start_color="FFFFFF",
+            end_type="num", end_value=100, end_color="F8696B"))
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{ws.cell(1, ws.max_column).column_letter}{ws.max_row}"
+
+
+def _place(ws, chart, anchor, labels=False):
+    from openpyxl.chart.label import DataLabelList
+    chart.width, chart.height = 24, 10
+    chart.gapWidth = 60
+    if labels:  # only the value on each bar; the series and category names would crowd the chart
+        chart.dataLabels = DataLabelList(showVal=True, showSerName=False, showCatName=False,
+                                         showLegendKey=False, showPercent=False)
+    chart.title.overlay = False  # Excel draws titles and legends over the plot unless told not to
+    chart.y_axis.title.overlay = False
+    chart.y_axis.number_format = "0"
+    if chart.legend is not None:  # a single-series chart has no legend
+        chart.legend.position = "b"
+        chart.legend.overlay = False
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    ws.add_chart(chart, anchor)
+
+
+def _weekly_chart(ws, provider, first, last):
+    from openpyxl.chart import BarChart, LineChart, Reference, Series
+    from openpyxl.chart.marker import Marker
+    bar = BarChart()
+    bar.type = "col"
+    bar.title = f"{provider}: quota settimanale consumata per giorno"
+    bar.y_axis.title = "% della settimana"
+    bar.y_axis.scaling.min, bar.y_axis.scaling.max = 0, 100
+    bar.x_axis.number_format = "dd/mm"
+    bar.series.append(Series(Reference(ws, min_col=3, min_row=first, max_row=last), title="Consumo del giorno"))
+    bar.set_categories(Reference(ws, min_col=2, min_row=first, max_row=last))
+    line = LineChart()
+    end_of_day = Series(Reference(ws, min_col=4, min_row=first, max_row=last), title="Fine giornata")
+    end_of_day.marker = Marker(symbol="circle", size=8)  # a single day is a single point: draw it
+    end_of_day.smooth = False
+    line.series.append(end_of_day)
+    line.y_axis.axId = 100  # same axis as the bars: both are shares of the weekly quota
+    bar += line
+    return bar
+
+
+def _peak_chart(ws, provider, first, last):
+    from openpyxl.chart import BarChart, Reference, Series
+    bar = BarChart()
+    bar.type = "col"
+    bar.title = f"{provider}: picco delle finestre 5h per giorno"
+    bar.y_axis.title = "% della finestra 5h"
+    bar.y_axis.scaling.min, bar.y_axis.scaling.max = 0, 100
+    bar.x_axis.number_format = "dd/mm"
+    bar.series.append(Series(Reference(ws, min_col=6, min_row=first, max_row=last), title="Picco medio"))
+    bar.series.append(Series(Reference(ws, min_col=7, min_row=first, max_row=last), title="Picco massimo"))
+    bar.set_categories(Reference(ws, min_col=2, min_row=first, max_row=last))
+    return bar
+
+
+def _window_chart(ws, provider, first, last):
+    from openpyxl.chart import BarChart, Reference, Series
+    bar = BarChart()
+    bar.type = "col"
+    bar.title = f"{provider}: picco di ogni finestra 5h"
+    bar.y_axis.title = "% usato al picco"
+    bar.y_axis.scaling.min, bar.y_axis.scaling.max = 0, 100
+    bar.x_axis.number_format = "dd/mm HH:mm"
+    bar.series.append(Series(Reference(ws, min_col=4, min_row=first, max_row=last), title="Picco"))
+    bar.set_categories(Reference(ws, min_col=2, min_row=first, max_row=last))
+    bar.x_axis.auto = False  # text axis: several windows can start on the same day
+    bar.varyColors = False
+    bar.legend = None
+    return bar
 
 
 def export_usage_report(year, month, path=QUOTA_DB, out_dir=REPORTS_DIR):
     """Write one month of 5h and weekly usage to an .xlsx file and return its path."""
-    from openpyxl import Workbook  # lazy: only the export needs it
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
     start = datetime(year, month, 1).timestamp()
     end = datetime(year + month // 12, month % 12 + 1, 1).timestamp()
     with closing(_open_quota_db(path)) as db:
@@ -250,18 +400,38 @@ def export_usage_report(year, month, path=QUOTA_DB, out_dir=REPORTS_DIR):
     ws = wb.active
     ws.title = "Giornaliero"
     ws.append(["Provider", "Giorno", "Settimana: consumo del giorno (%)", "Settimana: fine giornata (%)",
-               "Ritmo teorico settimana (%)", "5h: finestre iniziate", "5h: picco medio (%)", "5h: picco massimo (%)"])
+               "5h: finestre iniziate", "5h: picco medio (%)", "5h: picco massimo (%)"])
     for d in daily:
-        ws.append([d["provider"], d["day"], d["week_gain"], d["week_end"], round(100 / 7, 1),
-                   d["n5h"], d["peak_avg"], d["peak_max"]])
+        ws.append([d["provider"], d["day"], d["week_gain"], d["week_end"], d["n5h"], d["peak_avg"], d["peak_max"]])
+    _style_table(ws, {"B": "dd/mm/yyyy", "C": "0.0", "D": "0.0", "E": "0", "F": "0.0", "G": "0"},
+                 [12, 14, 20, 20, 14, 16, 16], scale_cols="FG")
+    row = 2
+    for provider, (first, last) in _provider_spans(daily).items():
+        chunk = daily[first - 2:last - 1]
+        if any(d["week_gain"] is not None for d in chunk):
+            _place(ws, _weekly_chart(ws, provider, first, last), f"I{row}", labels=True)
+            row += 18
+        if any(d["n5h"] for d in chunk):
+            _place(ws, _peak_chart(ws, provider, first, last), f"I{row}", labels=True)
+            row += 18
+
     ws5 = wb.create_sheet("Finestre 5h")
     ws5.append(["Provider", "Inizio", "Fine", "Picco (%)"])
     for w in windows:
         ws5.append([w["provider"], w["start"], w["end"], w["peak"]])
-    for sheet in (ws, ws5):
-        sheet.freeze_panes = "A2"
-        for col in sheet.columns:
-            sheet.column_dimensions[col[0].column_letter].width = 26
+    _style_table(ws5, {"B": "dd/mm/yyyy HH:mm", "C": "dd/mm/yyyy HH:mm", "D": "0"}, [12, 18, 18, 12], scale_cols="D")
+    row = 2
+    for provider, (first, last) in _provider_spans(windows).items():
+        _place(ws5, _window_chart(ws5, provider, first, last), f"F{row}")
+        row += 18
+
+    notes = wb.create_sheet("Come leggere")
+    for line in _REPORT_NOTES:
+        notes.append([line])
+    notes.column_dimensions["A"].width = 120
+    for cell in notes["A"]:
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    notes["A1"].font = Font(bold=True, size=14)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"codexbar-{year}-{month:02d}.xlsx"
@@ -271,6 +441,7 @@ def export_usage_report(year, month, path=QUOTA_DB, out_dir=REPORTS_DIR):
 
 def _check_usage_report():
     import tempfile
+    import zipfile
     from openpyxl import load_workbook
     day0 = datetime(2026, 11, 16).timestamp()
 
@@ -280,7 +451,7 @@ def _check_usage_report():
     def sample(provider, win, at_h, used, reset_h, duration):
         return dict(zip(_SAMPLE_COLUMNS, (provider, win, hour(at_h), used, hour(reset_h), duration)))
 
-    week, five_h = 7 * 86400, 5 * 3600
+    week, five_h, month = 7 * 86400, 5 * 3600, 30 * 86400
     rows = [
         # weekly W1 starts at 9.5 h, so its first sample is near the start: day 1 = 10 + 6 = 16, day 2 = 2 + 12
         sample("codex", "weekly", 10, 10, 177.5, week),
@@ -297,6 +468,9 @@ def _check_usage_report():
         sample("codex", "session", 23.5, 5, 28, five_h),
         sample("codex", "session", 27, 80, 28, five_h),
         sample("codex", "session", 36, 12, 40, five_h),
+        # a 30-day window on the same provider is not a 5h window: it stays out of the report
+        sample("codex", "session", 2, 14, 722, month),
+        sample("codex", "session", 10, 14, 722, month),
     ]
     daily, windows = _usage_report_rows(rows, day0, hour(48))
     by_day = {(d["provider"], d["day"].day): d for d in daily}
@@ -306,6 +480,7 @@ def _check_usage_report():
     assert day1["n5h"] == 3 and day1["peak_max"] == 80 and day1["peak_avg"] == 61.7
     assert day2["n5h"] == 1 and day2["peak_max"] == 12
     assert len(windows) == 4
+    assert _window_kind(month) is None and _window_kind(five_h) == "5h"
     # a weekly window first seen at 40% a day after its start: those 40 points are not day gain
     late_days, _ = _usage_report_rows([sample("claude", "weekly", 96, 40, 192, week),
                                        sample("claude", "weekly", 100, 45, 192, week)], day0, hour(120))
@@ -318,14 +493,24 @@ def _check_usage_report():
         _save_quota("codex", history, db)  # same sample twice
         with closing(sqlite3.connect(db)) as con:
             assert con.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+            assert _load_quota("codex", db)["session"] == history["session"]  # survives a restart
             con.execute("DELETE FROM samples")
             con.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?)",
                             [tuple(r[c] for c in _SAMPLE_COLUMNS) for r in rows])
             con.commit()
         out = export_usage_report(2026, 11, db, Path(directory))
         book = load_workbook(out)
-        assert book.sheetnames == ["Giornaliero", "Finestre 5h"]
+        assert book.sheetnames == ["Giornaliero", "Finestre 5h", "Come leggere"]
         assert book["Giornaliero"].max_row == 3 and book["Finestre 5h"].max_row == 5
+        assert book["Giornaliero"]["A1"].font.bold
+        with zipfile.ZipFile(out) as z:
+            # codex weekly consumption, codex 5h peaks per day, codex window peaks
+            assert sum(n.startswith("xl/charts/chart") for n in z.namelist()) == 3
+        # an empty month must still open cleanly: no charts, no colour scale ranges
+        empty = export_usage_report(2025, 1, db, Path(directory))
+        assert load_workbook(empty).sheetnames == ["Giornaliero", "Finestre 5h", "Come leggere"]
+        with zipfile.ZipFile(empty) as z:
+            assert not [n for n in z.namelist() if n.startswith("xl/charts/")]
 
 
 def _check_quota_forecast():
@@ -2110,8 +2295,8 @@ class CodexBarApp:
         self.popup = None
         self.running = True
         self.codex_data = None
-        self.quota_history = {"session": [], "weekly": []}
-        self.claude_history = {"session": [], "weekly": []}
+        self.quota_history = _load_quota("codex")  # the chart starts from the stored samples, not from zero
+        self.claude_history = _load_quota("claude")
         self._reset_warned = {}  # (provider, window) -> reset_at already notified
         self.window_alerts = window_alerts
         self._session_reset_seen = {}  # provider -> last 5h reset_at still in the future
