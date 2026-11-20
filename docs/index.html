@@ -58,14 +58,14 @@
 
     <div class="install-cmd">
       <span>$</span>
-      <code>pip install pystray Pillow customtkinter pywinpty</code>
+      <code>pip install pystray Pillow customtkinter pywinpty openpyxl</code>
       <button class="copy-btn" onclick="copyInstall(this)">Copy</button>
     </div>
 
     <ul class="features">
       <li>Dual provider — Claude Code + OpenAI Codex with animated tab switching</li>
       <li>Live session &amp; weekly usage bars with reset times</li>
-      <li>Fetches data via PTY, OAuth, cookies, or JSONL logs</li>
+      <li>Fetches data via OAuth, PTY, or JSONL logs</li>
       <li>API cost tracking — today and last 30 days</li>
       <li>Tray icon switches between Claude &amp; OpenAI per active tab</li>
       <li>Auto-refreshes every 5 minutes</li>
@@ -86,15 +86,15 @@
 <section class="details wrap" data-animate="4">
   <article class="card">
     <h2>Install in seconds</h2>
-    <p>Clone the repo, <code>pip install -r requirements.txt</code>, run <code>python codexbar.py</code>.
+    <p>Clone the repo, <code>uv sync</code>, then <code>uv run codexbar.py</code>.
     Or double-click <code>CodexBar.bat</code> — it handles everything. Build a standalone
     <code>.exe</code> with the included PyInstaller script.</p>
   </article>
   <article class="card">
     <h2>Claude Code native</h2>
-    <p>Built specifically for Claude Code on Windows. Spawns an interactive PTY session,
-    sends <code>/usage</code>, and parses the real output — the same method the macOS version uses.
-    Falls back to OAuth token or browser cookies automatically.</p>
+    <p>Built specifically for Claude Code on Windows. Reads the OAuth token Claude Code already stores,
+    and falls back to an interactive PTY session that sends <code>/usage</code> and parses the real output.
+    No browser cookies are read.</p>
   </article>
   <article class="card">
     <h2>Privacy first</h2>
@@ -120,9 +120,9 @@
   </article>
   <article class="card">
     <h2>Smart fallback chain</h2>
-    <p>Tries CLI via PTY first (most accurate), then OAuth token from
-    <code>~/.claude/.credentials.json</code>, then browser cookies with
-    DPAPI decryption, then JSONL logs. Always gets your data.</p>
+    <p>Tries the OAuth token from
+    <code>~/.claude/.credentials.json</code> first, then the Claude CLI via PTY (fallback), then JSONL logs.
+    Always gets your data.</p>
   </article>
 </section>
 
@@ -156,7 +156,7 @@
 
 <script>
 function copyInstall(btn) {
-  navigator.clipboard.writeText('pip install pystray Pillow customtkinter pywinpty');
+  navigator.clipboard.writeText('pip install pystray Pillow customtkinter pywinpty openpyxl');
   btn.textContent = 'Copied!';
   btn.classList.add('copied');
   setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);

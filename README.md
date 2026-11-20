@@ -56,10 +56,10 @@ This runs `uv sync --group dev` and PyInstaller, creating `dist\CodexBar.exe` (o
 - **Live usage bars** — how much of the session/weekly limit is still left, color-coded, or `—` when the quota isn't readable
 - **Tray tooltip** — hovering the tray icon shows what is left on the 5h and weekly window
 - **Reset countdowns** — know exactly when your limits refresh
-- **Threshold alerts** — tray notification when a 5h or weekly window crosses 80% or 95% used (once per crossing; a reset re-arms it)
+- **Threshold alerts** — tray notification when a 5h or weekly window crosses 80% or 95% used (once per crossing; a reset re-arms it), plus a last-minute warning when a window above 90% used is about to reset
 - **5h window alerts** — tray notification 15 min before a 5h window ends and when the next one starts, for Claude and Codex (on by default; `--no-window-alerts` turns them off). Claude needs reset times from the OAuth source, so these alerts don't fire when the CLI source supplies the data
 - **Cost tracking** — Claude from `~/.claude` logs, Codex tab from pi agent's own priced logs (`~/.pi/agent/sessions`): real tokens, not an estimate
-- **Usage report (Excel)** — every quota sample (5h and weekly, Claude and Codex) is stored in `~/.codexbar/usage.db` (history starts from the first run, no backfill). Tray → *Esporta report Excel* writes the current month to `~/.codexbar/reports/` and opens it: daily weekly consumption, weekly % at end of day, and the 5h windows with their peak. Other months: `uv run codexbar.py --export-report 2026-10`. Needs `openpyxl` (installed by `uv sync`)
+- **Usage report (Excel)** — every quota sample (5h and weekly, Claude and Codex) is stored in `~/.codexbar/usage.db` (history starts from the first run, no backfill). Tray → *Esporta report Excel* writes the current month to `~/.codexbar/reports/` and opens it: daily weekly consumption, weekly % at end of day, and the 5h windows with their peak, plus charts and a *Come leggere il report* sheet that explains the columns. Windows of other lengths (e.g. Codex's 30-day window) are left out. Other months: `uv run codexbar.py --export-report 2026-10`. Needs `openpyxl` (installed by `uv sync`)
 - **Native popup** — customtkinter window with rounded corners, slide-up animation
 - **Provider branding** — Claude orange palette + OpenAI dark/green theme, tray icon switches per tab
 - **Smart default tab** — opens on Codex (with the OpenAI tray icon) when Claude Code is not installed
@@ -74,8 +74,8 @@ For **Claude Code**, CodexBar tries these sources in order for quota; JSONL logs
 
 | Priority | Method | What it does |
 |----------|--------|-------------|
-| 1 | **CLI (PTY)** | Spawns interactive `claude` via pseudo-terminal, sends `/usage`, parses output |
-| 2 | **OAuth token** | Reads `~/.claude/.credentials.json`, calls Claude.ai API |
+| 1 | **OAuth token** | Reads `~/.claude/.credentials.json`, calls Claude.ai API |
+| 2 | **CLI (PTY)** | Fallback: spawns interactive `claude` via pseudo-terminal, sends `/usage`, parses output. Each call leaked a ConPTY host process, so it runs only when OAuth fails |
 | 3 | **JSONL logs** | Scans `~/.claude/projects/` for conversation usage and cost |
 
 For **Codex** the quota comes from the same endpoint the ChatGPT dashboard uses
@@ -97,7 +97,7 @@ logs.
 | **UI** | SwiftUI menu bar popup | customtkinter system tray popup |
 | **Language** | Swift | Python |
 | **Providers** | 16+ (Claude, Cursor, Copilot, Gemini...) | Claude Code + OpenAI Codex |
-| **Data source** | CLI PTY | CLI PTY → OAuth → JSONL |
+| **Data source** | CLI PTY | OAuth → CLI PTY → JSONL |
 | **Install** | `brew install --cask steipete/tap/codexbar` | Download `CodexBar.exe` from [v1.2.0](https://github.com/paraflu/CodexBar-Win/releases/tag/v1.2.0), or build with uv |
 | **Auto-update** | Sparkle framework | Manual download / rebuild |
 | **Browser access** | Keychain cookie read | None |
@@ -113,6 +113,8 @@ logs.
 | Codex quota unavailable | Sign in to Codex CLI so `~/.codex/auth.json` exists; refresh falls back to the last readable local rollout |
 | Codex “Today” cost is `—` or $0.00 | pi must have recorded assistant usage today in `~/.pi/agent/sessions`; Windows logs only (WSL sessions are not included) |
 | Popup doesn't appear | Check the system tray overflow area (click ^ arrow near clock) |
+| “CodexBar is already running” dialog | Only one copy runs at a time. Use the tray icon, or Quit from its menu before starting another |
+| Excel report is empty for a past month | Samples are stored only from the first run of this version; there is no backfill |
 | Startup option doesn't stick | It writes a per-user Windows Run entry; no admin required, but the executable must stay at the same path |
 
 ## Credits
