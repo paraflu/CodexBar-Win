@@ -20,6 +20,36 @@ A bottom bar for [Herdr](https://herdr.dev) (`herdr-app`). It shows the focused 
 
 ## Install
 
+### With an agent (recommended)
+
+Paste this prompt into an agent running on the machine with Herdr:
+
+````text
+Install this Herdr mod for me. Do not commit or change anything in git.
+
+Source: `https://github.com/paraflu/CodexBar-Win`, folder `herdr-codex-bar/mods/codex-bar` (branch `docs/update-readme-landing`). Clone or download it first.
+
+1. Before copying anything, tell me the mod (a) sends a request to `api.anthropic.com` with my Claude token from `%USERPROFILE%\.claude\.credentials.json`, (b) runs `python` on Windows and `python3` on WSL, and (c) reads files outside its own folder. Wait for my OK.
+2. Copy `mods/codex-bar/` to `%USERPROFILE%\.config\herdr-app\mods\codex-bar\`. Do not copy `quota-cache.json` or `__pycache__`. If that folder already exists, stop and ask me before overwriting.
+3. Do not edit Herdr's own files (`frame/`, `*.d.ts`, `AGENTS.md`, `mods/` shipped by Herdr). Ask me which layout in `%USERPROFILE%\.config\herdr-app\layouts\` should show the bar. If it is a shipped one (`main`, `terminals`, `win98`), clone it first with `herdr-app do layout.clone '{"name":"<layout>","as":"<layout>-codex"}'` and edit the clone.
+4. In that layout, add this block to the bottom column, next to the other blocks. Keep every existing block and make sure `id` is unique:
+
+   ```json
+   {
+     "id": "codex-bar",
+     "type": "block",
+     "content": { "mod": "codex-bar" },
+     "size": { "px": 28 }
+   }
+   ```
+
+5. Run `herdr-app check "%USERPROFILE%\.config\herdr-app\mods\codex-bar"` and fix any error. Then run `herdr-app status` and report any error it shows.
+6. Check the prerequisites and tell me what is missing, without changing anything: `python --version` must print Python 3; the file `%USERPROFILE%\.claude\.credentials.json` must exist (Claude Code logged in). Do not print the contents of that file.
+7. Finish by telling me how to see the bar (`ctrl-shift-l` to switch to the layout) and what the Claude chip shows if it is not logged in (`—`).
+````
+
+### Manual
+
 1. Copy the `mods/codex-bar/` folder to `%USERPROFILE%\.config\herdr-app\mods\codex-bar\`. Do not copy `quota-cache.json` or `__pycache__`.
 2. Add this block to the layout where the bar should appear (for example the bottom column of `layouts/<name>.json`). The mod's `mod.json` sets `"place": "none"`, so it shows only where a layout puts it:
 
