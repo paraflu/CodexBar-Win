@@ -1,0 +1,5 @@
+**/gpui-kit.d.ts
+**/jsconfig.json
+**/__pycache__/
+
+quota-cache.json
