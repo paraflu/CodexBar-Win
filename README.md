@@ -117,6 +117,16 @@ logs.
 | Excel report is empty for a past month | Samples are stored only from the first run of this version; there is no backfill |
 | Startup option doesn't stick | It writes a per-user Windows Run entry; no admin required, but the executable must stay at the same path |
 
+## Herdr bottom bar (codex-bar)
+
+The Claude quota is also shown in a bottom bar for [Herdr](https://herdr.dev), in [`herdr-codex-bar/`](herdr-codex-bar/README.md). Short install:
+
+1. Copy `herdr-codex-bar/mods/codex-bar/` to `%USERPROFILE%\.config\herdr-app\mods\codex-bar\`.
+2. Add a `codex-bar` block (`"content": {"mod": "codex-bar"}`, `"size": {"px": 28}`) to a Herdr layout.
+3. Run `herdr-app check` on the mod folder.
+
+Requirements, data handling and troubleshooting are in [`herdr-codex-bar/README.md`](herdr-codex-bar/README.md).
+
 ## Credits
 
 Windows port inspired by [steipete/CodexBar](https://github.com/steipete/CodexBar) (MIT) by [Peter Steinberger](https://steipete.me) — the original macOS menu bar app.
